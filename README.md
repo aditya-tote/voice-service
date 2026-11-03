@@ -56,6 +56,8 @@ set -a; . ./.env; set +a
 
 Use one worker. `GET /health/ready` verifies runtime packages and the local PersonaPlex TCP port only; it does not prove a model can produce audio. Run `voice-harness-probe NATF2.pt` on the GPU VM before a controlled phone test.
 
+The probe streams paced silence continuously while receiving model output and decoding it back to PCM. Its output deadline is 30 seconds after the handshake by default; `voice-harness-probe NATF2.pt --timeout 45` changes it. A timeout reports sent Opus packets, received audio, decoded bytes and text frame counts. Silence does not guarantee a spoken response, so inspect model logs if audio arrives without text. The earlier 60 ms input burst was insufficient for a streaming test.
+
 ## Enabling ViH only after provider confirmation
 
 `BRIDGE_API_KEY` authorizes the agent/manual caller. `VIH_UKEY` is only sent in ViH's OBD request. `VIH_CDR_SECRET` is separate and validates ViH's CDR callback. Never reuse them.
@@ -120,6 +122,6 @@ The OBD HTTP client has a 15-second overall deadline, bounded response storage, 
 
 Playback `mark` acknowledgements are counted, and `clear` framing is supported and used during failure teardown. Full interruption handling still needs a caller-VAD/model-reset policy; it is not enabled automatically. No audio is emitted after the provider's `stop`, so queued audio and a residual final fragment are discarded at call termination.
 
-Local verification: 61 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
+Local verification: 69 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
 
 Nginx must proxy `/calls/` to `MEDIA_HOST:MEDIA_PORT` and `/webhooks/vih/cdr` to the actual `CONTROL_HOST:CONTROL_PORT`; edit the example's loopback target if the control listener is bound to the GPU VM Tailscale address.
