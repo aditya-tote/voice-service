@@ -139,7 +139,10 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                     codec.close()
             if recorder:
                 recorder.close()
-            await calls.finish_media(call_id, reason, "".join(text), stream_stats(), recording_refs())
+            # The provider's validated terminal event remains authoritative even
+            # if a model task fails or shutdown races with the same stop.
+            await calls.finish_media(call_id, "provider_stop" if protocol.stopped else reason,
+                                     "".join(text), stream_stats(), recording_refs())
             text.clear()
 
         try:

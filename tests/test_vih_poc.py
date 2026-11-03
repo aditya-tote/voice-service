@@ -124,3 +124,19 @@ def test_live_mode_rejects_static_or_disabled_calling_configuration(tmp_path):
             vih_wss_value_mode="confirmed_static", vih_wss_value="static", vih_cdr_auth_mode="bearer",
             vih_cdr_secret="c" * 32, vih_response_call_id_path="/callSid",
         )
+
+
+def test_live_audio_allows_disabled_cdr_but_enabled_cdr_keeps_auth_and_correlation(tmp_path):
+    values = {"media_auth_mode": "query", "vih_dial_mode": "live", "enable_live_dials": True,
+              "vih_obd_url": "https://vih.example/dial", "vih_ukey": "u",
+              "vih_service_no": "service", "vih_template_id": "template", "vih_campaign_type": "3",
+              "vih_wss_value_mode": "confirmed_dynamic",
+              "vih_wss_value": "wss://bridge.example.com/calls/{callId}?token={token}"}
+    config = settings(tmp_path, **values)
+    assert config.vih_cdr_auth_mode == "disabled" and not config.vih_response_call_id_path
+    with pytest.raises(ValueError, match="VIH_CDR_SECRET"):
+        settings(tmp_path, **values, vih_cdr_auth_mode="bearer")
+    with pytest.raises(ValueError, match="response ID path"):
+        settings(tmp_path, **values, vih_cdr_auth_mode="bearer", vih_cdr_secret="c" * 32)
+    assert settings(tmp_path, **values, vih_cdr_auth_mode="query", vih_cdr_secret="c" * 32,
+                    vih_response_campaign_id_path="/campaignId").enable_live_dials

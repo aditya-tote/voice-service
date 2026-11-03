@@ -137,6 +137,57 @@ async def test_early_stream_provider_ids_survive_missing_dial_response_id(tmp_pa
     calls.repository.connection.close()
 
 
+@pytest.mark.asyncio
+async def test_stop_before_dial_response_stays_complete_without_cdr(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    config = replace(live_settings(tmp_path), vih_cdr_auth_mode="disabled",
+                     vih_cdr_secret="", vih_response_call_id_path="")
+    calls = CallService(config)
+    dial_count = 0
+
+    async def ready():
+        return True
+
+    async def dial(phone, wss):
+        nonlocal dial_count
+        dial_count += 1
+        parsed = urlsplit(wss)
+        call_id = parsed.path.rsplit("/", 1)[1]
+        await calls.claim_media(call_id, parse_qs(parsed.query)["token"][0])
+        await calls.bind_stream(call_id, start_event())
+        await calls.finish_media(call_id, "provider_stop", "Saved greeting", {}, {})
+        return DialResult("submitted", {"body": {"accepted": True}})
+
+    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls.vih, "dial", dial)
+    request = StartCall.model_validate(body())
+    created = await calls.start(request, "stop-before-http")
+    assert created.state == "completed" and calls.result(created.callId)["complete"]
+    assert calls.result(created.callId)["cdr"] is None
+    assert calls.repository.get(created.callId)["gpu_lease"] == 0
+    replay = await calls.start(request, "stop-before-http")
+    assert replay.callId == created.callId and dial_count == 1
+    calls.repository.connection.close()
+
+
+def test_late_cdr_after_stop_cannot_release_next_calls_reservation(tmp_path):
+    calls = CallService(settings(tmp_path))
+    first, _ = calls.repository.create_or_replay("stop-first-call", body(), False)
+    calls.repository.update(first["id"], state="live", gpu_lease=1, call_sid="CA-first")
+    calls.repository.finish_media(first["id"], "provider_stop", "Saved text", {}, {})
+    second, _ = calls.repository.create_or_replay("stop-next-call", body(), False)
+    assert calls.repository.acquire_gpu(second["id"])
+    cdr = {"event": "cdr", "callSid": "CA-first", "disposition": "ANSWERED"}
+    assert calls.cdr(cdr)[0] == first["id"]
+    assert calls.result(first["id"])["agentText"] == "Saved text"
+    assert calls.result(first["id"])["correlationStatus"] == "matched"
+    assert calls.repository.get(second["id"])["gpu_lease"] == 1
+    assert calls.cdr(cdr)[1]
+    assert calls.repository.get(second["id"])["gpu_lease"] == 1
+    calls.repository.connection.close()
+
+
 def test_recovery_cdr_clears_recovery_flag_and_conflicting_ids_do_not_release(tmp_path):
     config = settings(tmp_path)
     service = CallService(config)

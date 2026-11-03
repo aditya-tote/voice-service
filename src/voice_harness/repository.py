@@ -157,9 +157,14 @@ class CallRepository:
     def finish_media(self, call_id: str, reason: str, agent_text: str, stats: dict[str, Any], recordings: dict[str, Any]) -> None:
         call = self.get(call_id)
         has_cdr = bool(call["cdr_json"])
+        # A validated stop is terminal evidence for this stream. A bare socket close
+        # cannot prove the phone call ended; retain admission until reconciled.
+        terminal = has_cdr or reason == "provider_stop"
         self.update(call_id, stream_active=0, agent_text=agent_text[:32768], stream_reason=reason[:256],
-                    stream_stats=stats, recordings=recordings, state="completed" if has_cdr else "stream_ended",
-                    gpu_lease=0 if has_cdr else 1, recovery_required=0 if has_cdr else call["recovery_required"])
+                    stream_stats=stats, recordings=recordings,
+                    state="completed" if terminal else "recovery_required",
+                    gpu_lease=0 if terminal else 1, recovery_required=0 if terminal else 1,
+                    media_token_digest=None)
 
     def _matching_call(self, payload: dict[str, Any]) -> str | None:
         columns = {"callSid": "call_sid", "streamSid": "stream_sid", "campaignId": "campaign_id"}
@@ -229,5 +234,8 @@ class CallRepository:
             "agentText": row.pop("agent_text"), "customerTranscript": None,
             "streamReason": row.pop("stream_reason"), "recoveryRequired": bool(row.pop("recovery_required")),
             "streamStats": row.pop("stream_stats"), "recordings": row.pop("recordings"),
-            "complete": state in {"completed", "failed"}, "correlationStatus": "matched" if has_cdr else "pending",
+            "complete": state in {"completed", "failed"},
+            "correlationStatus": "matched" if has_cdr else (
+                "not_received" if state in {"completed", "failed"} else "pending"
+            ),
         }

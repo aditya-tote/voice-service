@@ -60,15 +60,17 @@ class Socket:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cdr_first", [False, True])
-async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, monkeypatch, cdr_first):
+@pytest.mark.parametrize("cdr_timing", ["disabled", "before_stop", "after_stop"])
+async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, monkeypatch, cdr_timing):
     config = settings(tmp_path, media_auth_mode="query", vih_dial_mode="live",
                       enable_live_dials=True, vih_obd_url="https://vih.example/dial",
                       vih_ukey="not-a-real-key", vih_service_no="service", vih_template_id="wss-template",
                       vih_campaign_type="3",
-                      vih_response_call_id_path="/callSid",
-                      vih_wss_value_mode="confirmed_dynamic", vih_cdr_auth_mode="bearer",
-                      vih_cdr_secret="c" * 32, recording_dir=str(tmp_path / "audio"),
+                      vih_response_call_id_path="" if cdr_timing == "disabled" else "/callSid",
+                      vih_wss_value_mode="confirmed_dynamic",
+                      vih_cdr_auth_mode="disabled" if cdr_timing == "disabled" else "bearer",
+                      vih_cdr_secret="" if cdr_timing == "disabled" else "c" * 32,
+                      recording_dir=str(tmp_path / "audio"),
                       vih_wss_value="wss://bridge.example.com/calls/{callId}?token={token}")
     calls = CallService(config)
     dialed = {}
@@ -152,18 +154,27 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
         assert calls.result(call_id)["state"] == "live"
         assert calls.result(call_id)["recordings"]["caller"].endswith(".ulaw")
         cdr = {"event": "cdr", "callSid": "CA-test", "streamSid": "MZ-test", "disposition": "ANSWERED"}
-        if cdr_first:
+        if cdr_timing == "before_stop":
             calls.cdr(cdr)
             assert calls.repository.get(call_id)["gpu_lease"] == 1
             assert calls.result(call_id)["complete"] is False
         await socket.event({"event": "stop", "sequenceNumber": "3", "streamSid": "MZ-test",
                             "stop": {"callSid": "CA-test", "accountSid": "AC-test", "reason": "done"}})
         await asyncio.wait_for(task, 2)
-        if not cdr_first:
-            assert calls.result(call_id)["state"] == "stream_ended"
+        assert calls.result(call_id)["state"] == "completed"
+        assert calls.repository.get(call_id)["gpu_lease"] == 0
+        if cdr_timing == "after_stop":
             calls.cdr(cdr)
         result = (await http.get(response.json()["resultUrl"], headers=headers)).json()
-    assert result["complete"] and result["disposition"] == "ANSWERED"
+        if cdr_timing == "disabled":
+            assert (await http.post("/webhooks/vih/cdr", json=cdr)).status_code == 401
+    assert result["complete"] and not result["recoveryRequired"]
+    assert result["streamReason"] == "provider_stop"
+    if cdr_timing == "disabled":
+        assert result["disposition"] is None and result["cdr"] is None
+        assert result["correlationStatus"] == "not_received"
+    else:
+        assert result["disposition"] == "ANSWERED" and result["correlationStatus"] == "matched"
     assert result["agentText"] == "Hello customer" and result["customerTranscript"] is None
     assert result["streamStats"]["inboundAudioBytes"] == 800
     assert result["streamStats"]["outboundAudioBytes"] == 320
@@ -178,13 +189,16 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     calls.repository.connection.close()
     reopened = CallService(config)
     assert reopened.result(call_id)["agentText"] == "Hello customer"
+    assert reopened.result(call_id)["complete"] and not reopened.result(call_id)["recoveryRequired"]
+    next_call, _ = reopened.repository.create_or_replay("next-call-after-stop", body(), False)
+    assert reopened.repository.acquire_gpu(next_call["id"])
     reopened.repository.connection.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["connect", "malformed", "cancel", "binary"])
+@pytest.mark.parametrize("failure", ["connect", "malformed", "cancel", "binary", "disconnect", "timeout", "invalid_stop"])
 async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, monkeypatch, failure):
-    config = settings(tmp_path)
+    config = settings(tmp_path, idle_timeout_seconds=0.05 if failure == "timeout" else 60)
     calls = CallService(config)
     record, _ = calls.repository.create_or_replay("cleanup-1234", body(), False)
     call_id = record["id"]
@@ -230,13 +244,22 @@ async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, mo
     elif failure == "binary":
         await socket.incoming.put({"type": "websocket.receive", "bytes": b"\0\0"})
         await asyncio.wait_for(task, 2)
+    elif failure == "disconnect":
+        await socket.incoming.put({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(task, 2)
+    elif failure == "invalid_stop":
+        await socket.event({"event": "stop", "sequenceNumber": "2", "streamSid": "MZ-test",
+                            "stop": {"callSid": "CA-other", "accountSid": "AC-test"}})
+        await asyncio.wait_for(task, 2)
     else:
         await asyncio.wait_for(task, 2)
     assert socket.closed and clients[0].closed
     result = calls.result(call_id)
-    assert result["state"] == "stream_ended" and not result["complete"]
+    assert result["state"] == "recovery_required" and not result["complete"]
+    assert result["recoveryRequired"]
     assert calls.repository.get(call_id)["gpu_lease"] == 1
-    assert result["streamReason"] == ("service_shutdown" if failure == "cancel" else "bridge_error")
+    expected = {"cancel": "service_shutdown", "disconnect": "provider_disconnect", "timeout": "call_timeout"}
+    assert result["streamReason"] == expected.get(failure, "bridge_error")
     calls.repository.connection.close()
 
 

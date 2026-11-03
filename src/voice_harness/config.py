@@ -144,10 +144,13 @@ class Settings:
                 or self.vih_campaign_type not in {"3", "4"}
                 or self.vih_wss_value_mode == "unconfirmed"
                 or not self.vih_wss_value
-                or self.vih_cdr_auth_mode == "disabled"
-                or (not self.vih_response_call_id_path.startswith("/") and not self.vih_response_campaign_id_path.startswith("/"))
             ):
-                raise ValueError("live dialing requires confirmed ViH URL, credentials, WSS, and CDR auth")
+                raise ValueError("live dialing requires confirmed ViH URL, credentials, and WSS")
+            if self.vih_cdr_auth_mode != "disabled" and (
+                not self.vih_response_call_id_path.startswith("/")
+                and not self.vih_response_campaign_id_path.startswith("/")
+            ):
+                raise ValueError("live CDR reporting requires a confirmed provider response ID path")
         if self.vih_dial_mode == "live" and not self.enable_live_dials:
             raise ValueError("VIH_DIAL_MODE=live requires ENABLE_LIVE_DIALS=true")
         if self.vih_wss_value_mode == "confirmed_dynamic" and (

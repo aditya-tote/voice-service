@@ -37,12 +37,12 @@ curl --fail --request POST http://127.0.0.1:8080/v1/calls \
   --data-binary '@examples/start-call.json'
 ```
 
-The result contains `callId`, `simulated`, `state`, bounded dial data, provider IDs when known, CDR, `agentText`, `customerTranscript: null`, `complete`, and correlation status. Reusing the same key and identical body returns the existing call. Changing the body with that key returns 409 and never creates another attempt.
+The result contains `callId`, `simulated`, `state`, bounded dial data, provider IDs when known, CDR, `agentText`, `customerTranscript: null`, `complete`, and correlation status. A WSS-completed call without CDR reports `correlationStatus: "not_received"`; a received matching CDR reports `matched`. Reusing the same key and identical body returns the existing call. Changing the body with that key returns 409 and never creates another attempt.
 
 Example mock result shape:
 
 ```json
-{"callId":"call_...","simulated":true,"state":"completed","dial":{"request":{"mode":"mock"},"status":"simulated","response":{"mode":"mock","accepted":true}},"provider":{"callSid":null,"campaignId":null,"streamSid":null},"cdr":null,"agentText":"","customerTranscript":null,"complete":true,"correlationStatus":"pending"}
+{"callId":"call_...","simulated":true,"state":"completed","dial":{"request":{"mode":"mock"},"status":"simulated","response":{"mode":"mock","accepted":true}},"provider":{"callSid":null,"campaignId":null,"streamSid":null},"cdr":null,"agentText":"","customerTranscript":null,"complete":true,"correlationStatus":"not_received"}
 ```
 
 ## Linux / GPU VM
@@ -62,13 +62,22 @@ The probe streams paced silence continuously while receiving model output and de
 
 `BRIDGE_API_KEY` authorizes the agent/manual caller. `VIH_UKEY` is only sent in ViH's OBD request. `VIH_CDR_SECRET` is separate and validates ViH's CDR callback. Never reuse them.
 
-Set `ENABLE_LIVE_DIALS=true` and `VIH_DIAL_MODE=live` after ViH confirms the HTTPS OBD endpoint, service number, streaming template, approved campaign type, phone format, CDR authentication, and a returned call or campaign ID field. Configure that field with `VIH_RESPONSE_CALL_ID_PATH` or `VIH_RESPONSE_CAMPAIGN_ID_PATH`; this correlates calls that never open a stream. For this POC, `VIH_WSS_VALUE_MODE=confirmed_dynamic`, `MEDIA_AUTH_MODE=query`, and `VIH_WSS_VALUE` must exactly be `wss://your-public-origin/calls/{callId}?token={token}`. VAH blocks startup without these values. It sends one recipient with `sendnow=0`, `filetype=2`, and provider retry `0`; an uncertain submission is `dial_unknown` and is never automatically redialed.
+Set `ENABLE_LIVE_DIALS=true` and `VIH_DIAL_MODE=live` after ViH confirms the HTTPS OBD endpoint, service number, streaming template, approved campaign type, phone format, and the dynamic WSS value. For this POC, `VIH_WSS_VALUE_MODE=confirmed_dynamic`, `MEDIA_AUTH_MODE=query`, and `VIH_WSS_VALUE` must exactly be `wss://your-public-origin/calls/{callId}?token={token}`. A valid provider WSS `stop` event completes the call and releases its GPU reservation; CDR is not required for audio streaming. It sends one recipient with `sendnow=0`, `filetype=2`, and provider retry `0`; an uncertain submission is `dial_unknown` and is never automatically redialed.
 
 The guide does not establish whether `msisdnlist[].WSS` accepts a full dynamic URL. ViH must confirm this account supports it. A static WSS reference needs an additional provider-specific correlation adapter; `/stream` currently rejects connections.
 
-Register `https://your-public-origin/webhooks/vih/cdr` with ViH. Choose bearer authentication if ViH can send `Authorization: Bearer <VIH_CDR_SECRET>`; otherwise use the confirmed query-token callback URL. Do not use `BRIDGE_API_KEY` as a provider credential. Set `RECORDING_DIR=recordings` to retain both audio directions. Recordings contain audio sent/received at the bridge; playback marks provide separate acknowledgement, and audio queued when the call ends may not have played.
+CDR is optional. For the WSS-only audio demo, use:
 
-The provided ViH guide documents JSON WebSocket events with Base64 G.711 mu-law 8 kHz media. VAH includes a strict adapter for that protocol and the existing PersonaPlex codec boundary. A live stream is intentionally not enabled until ViH confirms how an OBD call maps to the public WSS path/credential and how its CDR is authenticated. Customer transcription needs a separate STT provider, so the POC returns `customerTranscript: null`.
+```dotenv
+VIH_CDR_AUTH_MODE=disabled
+VIH_CDR_SECRET=
+VIH_RESPONSE_CALL_ID_PATH=
+VIH_RESPONSE_CAMPAIGN_ID_PATH=
+```
+
+No webhook registration is needed for this mode. If completion reporting is needed later, register `https://your-public-origin/webhooks/vih/cdr` with ViH and configure bearer or query authentication with a distinct `VIH_CDR_SECRET`. Enabling live CDR reporting also requires either `VIH_RESPONSE_CALL_ID_PATH` or `VIH_RESPONSE_CAMPAIGN_ID_PATH` to reference a confirmed ID in the dial response; it reconciles calls such as `NO_ANSWER` that never opened the WSS stream. Without CDR, a submitted call that never opens WSS cannot be automatically finalized: verify its outcome with ViH before manual recovery. A restart preserves the reservation and marks it recovery-required; it does not resolve the provider outcome. Completed WSS-only results keep `cdr` and `disposition` null rather than inventing an outcome. Do not use `BRIDGE_API_KEY` as a provider credential. Set `RECORDING_DIR=recordings` to retain both audio directions. Recordings contain audio sent/received at the bridge; playback marks provide separate acknowledgement, and audio queued when the call ends may not have played.
+
+The provided ViH guide documents JSON WebSocket events with Base64 G.711 mu-law 8 kHz media. VAH includes a strict adapter for that protocol and the existing PersonaPlex codec boundary. A live stream is intentionally not enabled until ViH confirms how an OBD call maps to the public WSS path/credential. Customer transcription needs a separate STT provider, so the POC returns `customerTranscript: null`.
 
 ## Routes
 
@@ -76,10 +85,10 @@ The provided ViH guide documents JSON WebSocket events with Base64 G.711 mu-law 
 |---|---|---|
 | `POST /v1/calls` | Bridge bearer + `Idempotency-Key` | Agent-tool-shaped start request; mock completes locally. |
 | `GET /v1/calls/{id}` | Bridge bearer | Durable raw JSON result. |
-| `POST /webhooks/vih/cdr` | Confirmed provider bearer/query secret | Stores/reconciles terminal CDR; disabled by default. |
+| `POST /webhooks/vih/cdr` | Confirmed provider bearer/query secret | Optional: stores/reconciles terminal CDR; disabled by default. |
 | `WS /calls/{callId}` | One-use query media token | ViH JSON/Base64 μ-law stream, forwarded to local PersonaPlex. |
 
-`DATABASE_PATH` holds requests and outcomes with SQLite WAL. On restart in-flight live records become `recovery_required`; VAH never auto-redials. The CDR callback is idempotent. A CDR with no known `callSid`/`streamSid` is retained as an orphan rather than guessed from the phone number.
+`DATABASE_PATH` holds requests and outcomes with SQLite WAL. A valid WSS `stop` completes a call. On a disconnect, timeout, model/bridge failure, or restart, VAH marks the call `recovery_required`, retains its GPU reservation, and never auto-redials. An optional CDR can reconcile that uncertain state; a CDR with no known `callSid`/`streamSid` is retained as an orphan rather than guessed from the phone number.
 
 ## Checks
 
@@ -107,8 +116,8 @@ python scripts/check_mock_cli.py
 | `VIH_CAMPAIGN_TYPE` | empty | Account-approved `3` promotional or `4` transactional purpose. |
 | `VIH_PHONE_FORMAT` | `e164` | Confirm the account format. `e164` sends the agent's `+91...` unchanged; `india_national` sends the ten national digits and rejects non-Indian numbers. The agent API always accepts E.164. |
 | `VIH_WSS_VALUE_MODE`, `VIH_WSS_VALUE` | `unconfirmed`, empty | Live requires `confirmed_dynamic` and exact `wss://origin/calls/{callId}?token={token}`. Keep braces unquoted in `.env`; `set -a; . ./.env; set +a` preserves them. |
-| `VIH_CDR_AUTH_MODE`, `VIH_CDR_SECRET` | `disabled`, empty | Confirmed provider bearer or query authentication, with a distinct 32+ character secret. |
-| `VIH_RESPONSE_CALL_ID_PATH`, `VIH_RESPONSE_CAMPAIGN_ID_PATH` | empty | Hypothetical, account-confirmed JSON Pointer such as `/data/callSid` or `/data/campaignId`; do not assume these paths from the guide. One must be set for live `NO_ANSWER` correlation. |
+| `VIH_CDR_AUTH_MODE`, `VIH_CDR_SECRET` | `disabled`, empty | Optional CDR callback. Configure confirmed bearer or query authentication with a distinct 32+ character secret only when ViH completion reporting is enabled. |
+| `VIH_RESPONSE_CALL_ID_PATH`, `VIH_RESPONSE_CAMPAIGN_ID_PATH` | empty | Optional, account-confirmed JSON Pointer such as `/data/callSid` or `/data/campaignId`; do not assume these paths from the guide. Configure one with CDR to reconcile `NO_ANSWER` calls that never open WSS. |
 | `RECORDING_DIR` | empty | Optional service-account-only directory for caller/agent μ-law recordings. |
 | `MAX_FRAME_BYTES`, `MAX_TRANSCRIPT_CHARS` | `16384`, `32768` | Per-provider-frame and stored agent-text limits. |
 | `PERSONAPLEX_READY_TIMEOUT_SECONDS`, `IDLE_TIMEOUT_SECONDS`, `CLOSE_TIMEOUT_SECONDS`, `MAX_CALL_SECONDS` | `15`, `60`, `5`, `1800` | Model handshake, media inactivity, teardown, and call duration deadlines. |
@@ -116,12 +125,12 @@ python scripts/check_mock_cli.py
 
 Legacy session and controller settings apply only to isolated compatibility helpers; the deployed CLI disables `/sessions`. New calls do not call a controller or an agent callback. A future agent can poll and consume the same raw result returned in this POC.
 
-Live agent text, recording references, and counters are checkpointed every two seconds and saved again at cleanup. An abrupt process failure can lose the most recent checkpoint interval and cannot resume a live phone connection. In-flight calls retain their reservation after restart until an authoritative CDR reconciles them; do not clear that reservation and redial while the provider outcome remains unknown. Conflicting and unmatched CDRs remain in SQLite `provider_events` for review. SQLite and recording files are private on POSIX; configure service-account ACLs on Windows. Set a retention policy before longer use.
+Live agent text, recording references, and counters are checkpointed every two seconds and saved again at cleanup. A WSS `stop` is the normal completion signal for the audio-only flow. An abrupt process failure can lose the most recent checkpoint interval and cannot resume a live phone connection. Calls without a clean `stop` retain their reservation and require recovery; an optional authoritative CDR can reconcile them. Do not clear that reservation and redial while the provider outcome remains unknown. Conflicting and unmatched CDRs remain in SQLite `provider_events` for review. SQLite and recording files are private on POSIX; configure service-account ACLs on Windows. Set a retention policy before longer use.
 
 The OBD HTTP client has a 15-second overall deadline, bounded response storage, and no automatic retry. GPU admission occurs before dialing; readiness checks prove package availability and a TCP listener, so perform the model probe on the GPU VM too.
 
 Playback `mark` acknowledgements are counted, and `clear` framing is supported and used during failure teardown. Full interruption handling still needs a caller-VAD/model-reset policy; it is not enabled automatically. No audio is emitted after the provider's `stop`, so queued audio and a residual final fragment are discarded at call termination.
 
-Local verification: 69 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
+Local verification: 76 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
 
-Nginx must proxy `/calls/` to `MEDIA_HOST:MEDIA_PORT` and `/webhooks/vih/cdr` to the actual `CONTROL_HOST:CONTROL_PORT`; edit the example's loopback target if the control listener is bound to the GPU VM Tailscale address.
+Nginx must proxy `/calls/` to `MEDIA_HOST:MEDIA_PORT`. Proxy `/webhooks/vih/cdr` to the actual `CONTROL_HOST:CONTROL_PORT` only when CDR is enabled; edit the example's loopback target if the control listener is bound to the GPU VM Tailscale address.
