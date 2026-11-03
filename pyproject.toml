@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-agent-harness"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.141,<0.142", "uvicorn>=0.53,<0.54", "httpx>=0.28,<0.29"]
+
+[project.optional-dependencies]
+runtime = ["websockets>=15,<16", "numpy>=2.0", "soxr>=0.5", "sphn>=0.1"]
+dev = ["pytest>=9", "pytest-asyncio>=1", "ruff>=0.16", "mypy>=1.19"]
+
+[project.scripts]
+voice-harness = "voice_harness.main:run"
+voice-harness-probe = "voice_harness.probe:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

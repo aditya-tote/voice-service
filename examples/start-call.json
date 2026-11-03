@@ -1,0 +1,14 @@
+{
+  "leadId": "lead_123",
+  "customerPhone": "+919876543210",
+  "script": "Introduce the approved offer and ask for a follow-up.",
+  "context": {
+    "persona": "Sales representative",
+    "goal": "Book a follow-up",
+    "tone": "Calm and concise",
+    "facts": ["Asked about pricing"],
+    "limits": ["Do not promise a discount"]
+  },
+  "voiceName": "NATF2.pt",
+  "metadata": {"source": "manual-poc"}
+}
