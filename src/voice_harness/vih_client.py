@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 
 from .config import Settings
+from .diagnostics import obd_request_summary, obd_response_summary
 from .observability import error_type, log_event
 
 HTTP_DEADLINE_SECONDS = 15.0
@@ -95,6 +96,8 @@ class VihClient:
             return DialResult("simulated", {"mode": "mock", "accepted": True}, {"mode": "mock"})
         payload = dial_payload(self.settings, phone, wss_value)
         redacted = redacted_payload(payload)
+        log_event("obd_request", stage="obd", method="POST",
+                  provider_request=obd_request_summary(payload, self.settings.public_stream_base_url))
         try:
             async with asyncio.timeout(HTTP_DEADLINE_SECONDS), httpx.AsyncClient(
                 trust_env=False, timeout=httpx.Timeout(10, connect=3)
@@ -112,6 +115,9 @@ class VihClient:
                 token = parse_qs(urlsplit(stream_url).query).get("token", [""])[0]
                 body = _safe_response(content, (self.settings.vih_ukey, self.settings.vih_wss_value,
                                                 stream_url, token))
+                log_event("obd_response", stage="obd", status_code=response.status_code,
+                          truncated=oversized, provider_response=obd_response_summary(body),
+                          duration_ms=round((time.monotonic() - started) * 1000, 2))
                 log_event("dial_finished" if response.is_success and not oversized else "dial_failed",
                           logging.INFO if response.is_success and not oversized else logging.ERROR,
                           stage="obd", status_code=response.status_code,

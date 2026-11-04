@@ -15,6 +15,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from .audio import StreamingCodec
 from .auth import bearer_value
 from .call_service import CallService
+from .diagnostics import stream_event_summary
+from .media_diagnostics import MediaConnectionLoggingMiddleware
 from .models import Brief, StartCall
 from .observability import error_code, error_type, log_event
 from .personaplex import PersonaPlexClient, prompt_for
@@ -79,6 +81,7 @@ class _Recordings:
 def create_vih_media_app(calls: CallService) -> FastAPI:
     app = FastAPI(title="ViH Voice Harness Media", docs_url=None, redoc_url=None, openapi_url=None)
     settings = calls.settings
+    app.add_middleware(MediaConnectionLoggingMiddleware, auth_mode=settings.media_auth_mode)
 
     @app.websocket("/calls/{call_id}")
     async def call(socket: WebSocket, call_id: str) -> None:
@@ -88,7 +91,7 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
             request = await calls.claim_media(call_id, token or "")
         except RepositoryError as error:
             log_event("media_rejected", logging.WARNING, call_id=call_id, stage="media_auth",
-                      status_code=error.status, error_type="RepositoryError")
+                      status_code=error.status, error_type="RepositoryError", error_code=error_code(error))
             await socket.close(4401 if error.status == 401 else 4409)
             return
         except Exception as error:
@@ -181,6 +184,8 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                 async with asyncio.timeout(settings.ready_timeout_seconds):
                     while not protocol.started:
                         name, _ = protocol.ingest(await receive())
+                        log_event("provider_event_received", call_id=call_id, stage="provider_handshake",
+                                  provider_event=stream_event_summary(protocol.last_event))
                         if name == "start":
                             await calls.bind_stream(call_id, protocol.last_event)
                 log_event("stream_started", call_id=call_id, stage="provider_handshake")
@@ -216,7 +221,12 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                         except Exception:
                             failed_stage = "provider_receive"
                             raise
+                        if name in {"dtmf", "mark"}:
+                            log_event("provider_event_received", logging.DEBUG, call_id=call_id,
+                                      stage="provider_receive", provider_event=stream_event_summary(protocol.last_event))
                         if name == "stop":
+                            log_event("provider_event_received", call_id=call_id, stage="provider_receive",
+                                      provider_event=stream_event_summary(protocol.last_event))
                             reason = "provider_stop"
                             return
                         if pcm is not None:
@@ -331,7 +341,8 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
     @app.websocket("/stream")
     async def static_stream(socket: WebSocket) -> None:
         # The PDF doesn't define a trusted static-stream->our-call correlation contract.
-        log_event("media_rejected", logging.WARNING, stage="media_auth", status_code=403)
+        log_event("media_rejected", logging.WARNING, stage="media_auth", status_code=403,
+                  error_code="static_endpoint_disabled")
         await socket.close(4403)
 
     return app

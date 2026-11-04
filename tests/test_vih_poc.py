@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from voice_harness.call_service import CallService
 from voice_harness.config import Settings
 from voice_harness.controller_app import create_controller_app
+from voice_harness.observability import SafeJsonFormatter
 from voice_harness.session_store import SessionStore
 from voice_harness.vih_client import VihClient, redacted_payload
 from voice_harness.vih_protocol import VihProtocolError, VihStream, pcm_to_mulaw_messages
@@ -85,15 +87,16 @@ def test_vih_mu_law_protocol_is_strict_and_uses_160_byte_output():
 
 
 @pytest.mark.parametrize("explicit_url", [False, True])
-def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path, explicit_url):
+def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path, explicit_url, caplog):
+    caplog.set_level(logging.INFO, logger="voice_harness")
     seen = {}
-    stream_url = "wss://bridge.example.com/calls/test?token=private-once"
+    stream_url = "wss://bridge.example.com/calls/call_" + "a" * 36 + "?token=private-once"
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             assert self.headers["Content-Type"] == "application/json"
             seen.update(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-            response = {"campaign": "ok", "echo": seen, "credentialEcho": "private-once"}
+            response = {"status": "success", "value": "accepted", "echo": seen, "credentialEcho": "private-once"}
             self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(response).encode())
 
         def log_message(self, *_):
@@ -104,8 +107,9 @@ def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path,
     try:
         # Deliberately bypasses the production HTTPS/live interlock only to exercise a local HTTP stand-in.
         config = settings(tmp_path, vih_obd_url=f"http://127.0.0.1:{server.server_port}",
-                          vih_ukey="u-key", vih_service_no="service", vih_template_id="200",
-                          vih_campaign_type="4", vih_wss_value="configured-fallback" if explicit_url else stream_url)
+                          vih_ukey="u-key", vih_service_no="7971000000", vih_template_id="200",
+                          vih_campaign_type="4", vih_phone_format="india_national",
+                          vih_wss_value="configured-fallback" if explicit_url else stream_url)
         object.__setattr__(config, "vih_dial_mode", "live")
         result = asyncio.run(VihClient(config).dial("+919876543210", stream_url if explicit_url else None))
     finally:
@@ -113,14 +117,26 @@ def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path,
     assert result.status == "submitted"
     assert seen == {
         "sourcetype": "1", "sendnow": "0", "campaigntype": "4", "filetype": "2",
-        "ukey": "u-key", "serviceno": "service", "ivrtemplateid": "200",
+        "ukey": "u-key", "serviceno": "7971000000", "ivrtemplateid": "200",
         "retryatmpt": "0", "retryduration": "15",
-        "msisdnlist": [{"phoneno": "+919876543210", "param1": stream_url}],
+        "msisdnlist": [{"phoneno": "9876543210", "param1": stream_url}],
     }
     assert result.request["msisdnlist"][0]["param1"] == "[redacted]"
     assert result.body["body"]["echo"]["msisdnlist"][0]["param1"] == "[redacted]"
     assert "private-once" not in json.dumps(result.body) + json.dumps(result.request)
     assert "u-key" not in json.dumps(result.body) + json.dumps(result.request)
+    records = [record for record in caplog.records if record.name == "voice_harness"]
+    request_log = next(record.safe_event["provider_request"] for record in records
+                       if record.safe_event["event"] == "obd_request")
+    response_log = next(record.safe_event["provider_response"] for record in records
+                        if record.safe_event["event"] == "obd_response")
+    assert request_log["phone_digits"] == 10 and request_log["phone_format"] == "india_national"
+    assert request_log["token_present"] and request_log["wss_matches_public_base"]
+    assert request_log["wss_route"] == "/calls/{call_id}" and request_log["ivrtemplateid"] == "200"
+    assert response_log["status"] == "success" and response_log["value"] == "accepted"
+    rendered_logs = "\n".join(SafeJsonFormatter().format(record) for record in records)
+    for private in ("private-once", "u-key", "7971000000", "9876543210", stream_url):
+        assert private not in rendered_logs
 
 
 @pytest.mark.parametrize("field", ["param1", "PARAM1", "WSS"])

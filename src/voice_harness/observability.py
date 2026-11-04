@@ -8,6 +8,8 @@ import sys
 from contextvars import ContextVar
 from datetime import UTC, datetime
 
+from .diagnostics import safe_summary
+
 request_id_context: ContextVar[str | None] = ContextVar("request_id", default=None)
 call_id_context: ContextVar[str | None] = ContextVar("call_id", default=None)
 
@@ -19,10 +21,12 @@ EVENTS = frozenset({
     "media_input_started", "media_output_started", "model_text_started",
     "media_finished", "media_checkpoint", "service_starting", "service_stopped", "service_failed",
     "configuration_invalid", "recovery_detected",
+    "obd_request", "obd_response", "media_connection_attempt", "media_connection_closed",
+    "provider_event_received", "media_http_response",
 })
 ENUMS = {
     "route": {"/v1/calls", "/v1/calls/{call_id}", "/webhooks/vih/cdr", "/health/live",
-              "/health/ready", "/sessions", "/sessions/{session_id}", "unknown"},
+              "/health/ready", "/sessions", "/sessions/{session_id}", "/calls/{call_id}", "/stream", "unknown"},
     "method": {"GET", "POST", "DELETE", "PUT", "PATCH", "HEAD", "OPTIONS", "OTHER"},
     "state": {"created", "dialing", "dial_submitted", "dial_unknown", "connecting", "live",
               "stream_ended", "completed", "failed", "recovery_required"},
@@ -43,7 +47,9 @@ ENUMS = {
     "error_code": {"invalid_json", "invalid_sequence", "stream_mismatch", "stop_mismatch",
                    "unsupported_media_format", "invalid_audio_payload", "invalid_event",
                    "invalid_model_frame", "model_handshake_failed", "transcript_limit",
-                   "audio_limit", "unclassified"},
+                   "audio_limit", "unclassified", "call_not_found", "invalid_media_token",
+                   "media_unavailable", "static_endpoint_disabled"},
+    "auth_mode": {"header", "query"},
     "config_field": {"BRIDGE_API_KEY", "CONTROLLER_API_KEY", "CONTROL_HOST", "MEDIA_HOST",
                      "MEDIA_AUTH_MODE", "PERSONAPLEX_URL", "PUBLIC_STREAM_BASE_URL",
                      "CONTROLLER_CALLBACK_BASE_URL", "ALLOWED_VOICES", "VIH_DIAL_MODE",
@@ -55,13 +61,16 @@ COUNTERS = frozenset({
     "outbound_audio_bytes", "sequence_gaps", "agent_text_chars", "recovered_calls",
     "control_port", "media_port",
 })
-BOOLEANS = frozenset({"simulated", "duplicate", "matched", "recovery_required", "recording_enabled"})
+BOOLEANS = frozenset({"simulated", "duplicate", "matched", "recovery_required", "recording_enabled",
+                      "token_present", "query_token_present", "authorization_present", "accepted", "truncated"})
 
 
 def safe_fields(fields: dict) -> dict:
     safe = {}
     for key, value in fields.items():
-        if key in ENUMS and isinstance(value, str) and value in ENUMS[key]:
+        if key in {"provider_request", "provider_response", "provider_event"}:
+            safe[key] = safe_summary(key, value)
+        elif key in ENUMS and isinstance(value, str) and value in ENUMS[key]:
             safe[key] = value
         elif key in {"call_id", "request_id"} and isinstance(value, str):
             pattern = r"call_[a-f0-9]{36}" if key == "call_id" else r"[a-f0-9]{32}"
@@ -69,6 +78,7 @@ def safe_fields(fields: dict) -> dict:
                 safe[key] = value
         elif (
             (key == "status_code" and type(value) is int and 100 <= value <= 599)
+            or (key == "close_code" and type(value) is int and 1000 <= value <= 4999)
             or (key in COUNTERS and type(value) in {int, float} and math.isfinite(value) and value >= 0)
             or (key in BOOLEANS and type(value) is bool)
         ):
@@ -109,8 +119,12 @@ def error_code(error: BaseException) -> str:
         "agent transcript limit exceeded": "transcript_limit",
         "model audio frame too large": "audio_limit",
         "recording/audio duration limit exceeded": "audio_limit",
+        "call not found": "call_not_found",
+        "invalid media credential": "invalid_media_token",
+        "call media is not available": "media_unavailable",
     }
-    return codes.get(str(error), "unclassified")
+    message = getattr(error, "detail", "") if type(error).__name__ == "RepositoryError" else str(error)
+    return codes.get(message, "unclassified")
 
 
 def config_field(error: BaseException) -> str | None:

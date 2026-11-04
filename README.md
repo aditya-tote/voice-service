@@ -60,7 +60,9 @@ Use one worker. `GET /health/ready` verifies runtime packages and the local Pers
 
 VAH writes structured JSON events to standard output with a UTC `timestamp`, `level`, `event`, and applicable `call_id`, `stage`, `state`, `reason`, `error_type` or fixed `error_code`, plus safe counters such as `duration_ms`. HTTP responses include a generated `X-Request-ID`; its `request_id` links the request outcome to call creation and dialing logs. Use the `call_id` returned by `POST /v1/calls` to follow a call through dialing, WSS, PersonaPlex, and completion or recovery.
 
-Set `LOG_LEVEL=INFO` for normal operation: first incoming/outgoing audio events and progress counters every ten seconds show that the stream is active. `LOG_LEVEL=DEBUG` adds checkpoint counters every two seconds. Logs omit request bodies, phone numbers, scripts, prompts, audio, tokens, URLs, authorization headers, ViH credentials, and exception text. Dependency messages and tracebacks become generic component/severity events. Set `WARNING` or `ERROR` to reduce output.
+Set `LOG_LEVEL=INFO` for normal operation; no extra diagnostic environment setting is needed. It includes masked ViH OBD request/response summaries (approved field values, presence flags, response classification, HTTP status and duration) and WebSocket connection/event summaries (safe route, authentication-presence flags, fixed event metadata and close code). These make an accepted-but-not-connected call diagnosable without exposing provider traffic. `LOG_LEVEL=DEBUG` adds checkpoint counters every two seconds.
+
+Raw provider request bodies, response messages, URLs, provider call IDs, campaign IDs, WebSocket tokens, audio payloads, scripts, prompts, phone numbers, headers, credentials, exception text and incoming media events are never written to logs. Share only the JSON log lines produced by VAH; do not append copied provider payloads or screenshots containing secrets. Dependency messages and tracebacks become generic component/severity events. Set `WARNING` or `ERROR` to reduce output.
 
 On the GPU VM, retain a live copy while running the service:
 
@@ -86,6 +88,8 @@ The probe streams paced silence continuously while receiving model output and de
 Set `ENABLE_LIVE_DIALS=true` and `VIH_DIAL_MODE=live` after ViH confirms the HTTPS OBD endpoint, service number, streaming template, approved campaign type, phone format, and the dynamic WSS value. For this POC, `VIH_WSS_VALUE_MODE=confirmed_dynamic`, `MEDIA_AUTH_MODE=query`, and `VIH_WSS_VALUE` must exactly be `wss://your-public-origin/calls/{callId}?token={token}`. A valid provider WSS `stop` event completes the call and releases its GPU reservation; CDR is not required for audio streaming. It sends one recipient with `sendnow=0`, `filetype=2`, and provider retry `0`; an uncertain submission is `dial_unknown` and is never automatically redialed.
 
 The latest provider payload supplied for this integration uses `msisdnlist[].param1` for the complete per-call WSS URL and template ID `200`, replacing the earlier PDF's `WSS` field. Set `VIH_TEMPLATE_ID=200` for that account; the ID remains configurable. VAH sends the phone number from the agent request and campaign type, credentials and service number from the environment. It sends `retryatmpt="0"` and `retryduration="15"`. Scheduling is not exposed: `sendnow="0"`, so the unused example `schddate` is omitted. Verify the account template connects to the exact supplied path and query token in a controlled call. A fixed dashboard WSS reference instead needs a provider-specific correlation adapter; `/stream` currently rejects connections.
+
+The provider confirmed ten-digit Indian national numbers for `phoneno`. Set `VIH_PHONE_FORMAT=india_national` as in `.env.example`: the agent still sends E.164 (`+91` plus ten digits), and VAH strips the country code only for the outbound ViH request. Other country codes are rejected in this mode.
 
 CDR is optional. For the WSS-only audio demo, use:
 
