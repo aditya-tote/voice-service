@@ -36,7 +36,8 @@ def dial_payload(settings: Settings, phone: str, wss_value: str | None = None) -
     return {
         "ukey": settings.vih_ukey, "sourcetype": "1", "sendnow": "0", "campaigntype": settings.vih_campaign_type,
         "filetype": "2", "serviceno": settings.vih_service_no, "ivrtemplateid": settings.vih_template_id,
-        "retryatmpt": "0", "retryduration": "0", "msisdnlist": [{"phoneno": provider_phone(settings, phone), "WSS": wss_value or settings.vih_wss_value}],
+        "retryatmpt": "0", "retryduration": "15",
+        "msisdnlist": [{"phoneno": provider_phone(settings, phone), "param1": wss_value or settings.vih_wss_value}],
     }
 
 
@@ -63,7 +64,7 @@ def _redact(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     if not isinstance(value, dict):
         return value
     return {
-        key: "[redacted]" if key.lower() in {"ukey", "token", "authorization", "password", "wss"} else _redact(item, secrets)
+        key: "[redacted]" if key.lower() in {"ukey", "token", "authorization", "password", "wss", "param1"} else _redact(item, secrets)
         for key, item in value.items()
     }
 
@@ -107,9 +108,10 @@ class VihClient:
                             content = content[:8192]
                             oversized = True
                             break
-                token = parse_qs(urlsplit(wss_value or "").query).get("token", [""])[0]
+                stream_url = payload["msisdnlist"][0]["param1"]
+                token = parse_qs(urlsplit(stream_url).query).get("token", [""])[0]
                 body = _safe_response(content, (self.settings.vih_ukey, self.settings.vih_wss_value,
-                                                wss_value or "", token))
+                                                stream_url, token))
                 log_event("dial_finished" if response.is_success and not oversized else "dial_failed",
                           logging.INFO if response.is_success and not oversized else logging.ERROR,
                           stage="obd", status_code=response.status_code,

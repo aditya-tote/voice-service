@@ -85,7 +85,7 @@ The probe streams paced silence continuously while receiving model output and de
 
 Set `ENABLE_LIVE_DIALS=true` and `VIH_DIAL_MODE=live` after ViH confirms the HTTPS OBD endpoint, service number, streaming template, approved campaign type, phone format, and the dynamic WSS value. For this POC, `VIH_WSS_VALUE_MODE=confirmed_dynamic`, `MEDIA_AUTH_MODE=query`, and `VIH_WSS_VALUE` must exactly be `wss://your-public-origin/calls/{callId}?token={token}`. A valid provider WSS `stop` event completes the call and releases its GPU reservation; CDR is not required for audio streaming. It sends one recipient with `sendnow=0`, `filetype=2`, and provider retry `0`; an uncertain submission is `dial_unknown` and is never automatically redialed.
 
-The guide does not establish whether `msisdnlist[].WSS` accepts a full dynamic URL. ViH must confirm this account supports it. A static WSS reference needs an additional provider-specific correlation adapter; `/stream` currently rejects connections.
+The latest provider payload supplied for this integration uses `msisdnlist[].param1` for the complete per-call WSS URL and template ID `200`, replacing the earlier PDF's `WSS` field. Set `VIH_TEMPLATE_ID=200` for that account; the ID remains configurable. VAH sends the phone number from the agent request and campaign type, credentials and service number from the environment. It sends `retryatmpt="0"` and `retryduration="15"`. Scheduling is not exposed: `sendnow="0"`, so the unused example `schddate` is omitted. Verify the account template connects to the exact supplied path and query token in a controlled call. A fixed dashboard WSS reference instead needs a provider-specific correlation adapter; `/stream` currently rejects connections.
 
 CDR is optional. For the WSS-only audio demo, use:
 
@@ -134,7 +134,7 @@ python scripts/check_mock_cli.py
 | `PERSONAPLEX_URL`, `ALLOWED_VOICES` | local URL, required | Local model endpoint and allowlisted `.pt` voice names. |
 | `DATABASE_PATH` | `voice-harness.sqlite3` | SQLite WAL file for durable POC state. |
 | `VIH_DIAL_MODE`, `ENABLE_LIVE_DIALS` | `mock`, `false` | Mock is safe; both must explicitly enable live dialing. |
-| `VIH_OBD_URL`, `VIH_UKEY`, `VIH_SERVICE_NO`, `VIH_TEMPLATE_ID` | empty | Account-specific OBD endpoint and credentials/settings. |
+| `VIH_OBD_URL`, `VIH_UKEY`, `VIH_SERVICE_NO`, `VIH_TEMPLATE_ID` | example URL/template supplied; credentials empty | Account-specific OBD endpoint and credentials/settings. `.env.example` uses the supplied CreateOBDCampaignPost endpoint and template `200`; set explicitly for your account. |
 | `VIH_CAMPAIGN_TYPE` | empty | Account-approved `3` promotional or `4` transactional purpose. |
 | `VIH_PHONE_FORMAT` | `e164` | Confirm the account format. `e164` sends the agent's `+91...` unchanged; `india_national` sends the ten national digits and rejects non-Indian numbers. The agent API always accepts E.164. |
 | `VIH_WSS_VALUE_MODE`, `VIH_WSS_VALUE` | `unconfirmed`, empty | Live requires `confirmed_dynamic` and exact `wss://origin/calls/{callId}?token={token}`. Keep braces unquoted in `.env`; `set -a; . ./.env; set +a` preserves them. |
@@ -153,6 +153,6 @@ The OBD HTTP client has a 15-second overall deadline, bounded response storage, 
 
 Playback `mark` acknowledgements are counted, and `clear` framing is supported and used during failure teardown. Full interruption handling still needs a caller-VAD/model-reset policy; it is not enabled automatically. No audio is emitted after the provider's `stop`, so queued audio and a residual final fragment are discarded at call termination.
 
-Local verification: 83 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed, including safe JSON output assertions. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
+Local verification: see `../docs/qa/voice-harness-poc-verification.json` for current test counts, CLI/HTTP/restart checks and limits. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM.
 
 Nginx must proxy `/calls/` to `MEDIA_HOST:MEDIA_PORT`. Proxy `/webhooks/vih/cdr` to the actual `CONTROL_HOST:CONTROL_PORT` only when CDR is enabled; edit the example's loopback target if the control listener is bound to the GPU VM Tailscale address.

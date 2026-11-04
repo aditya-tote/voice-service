@@ -84,13 +84,17 @@ def test_vih_mu_law_protocol_is_strict_and_uses_160_byte_output():
         pass
 
 
-def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path):
+@pytest.mark.parametrize("explicit_url", [False, True])
+def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path, explicit_url):
     seen = {}
+    stream_url = "wss://bridge.example.com/calls/test?token=private-once"
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            assert self.headers["Content-Type"] == "application/json"
             seen.update(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-            self.send_response(200); self.end_headers(); self.wfile.write(b'{"campaign":"ok"}')
+            response = {"campaign": "ok", "echo": seen, "credentialEcho": "private-once"}
+            self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(response).encode())
 
         def log_message(self, *_):
             pass
@@ -99,19 +103,31 @@ def test_live_vih_client_serializes_documented_fields_against_loopback(tmp_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     try:
         # Deliberately bypasses the production HTTPS/live interlock only to exercise a local HTTP stand-in.
-        config = settings(tmp_path, vih_obd_url=f"http://127.0.0.1:{server.server_port}", vih_ukey="u-key", vih_service_no="service", vih_template_id="template", vih_wss_value="confirmed")
+        config = settings(tmp_path, vih_obd_url=f"http://127.0.0.1:{server.server_port}",
+                          vih_ukey="u-key", vih_service_no="service", vih_template_id="200",
+                          vih_campaign_type="4", vih_wss_value="configured-fallback" if explicit_url else stream_url)
         object.__setattr__(config, "vih_dial_mode", "live")
-        result = asyncio.run(VihClient(config).dial("+919876543210"))
+        result = asyncio.run(VihClient(config).dial("+919876543210", stream_url if explicit_url else None))
     finally:
-        server.shutdown(); thread.join()
+        server.shutdown(); server.server_close(); thread.join()
     assert result.status == "submitted"
-    assert seen["sendnow"] == "0" and seen["retryatmpt"] == "0" and seen["filetype"] == "2"
-    assert seen["msisdnlist"] == [{"phoneno": "+919876543210", "WSS": "confirmed"}]
+    assert seen == {
+        "sourcetype": "1", "sendnow": "0", "campaigntype": "4", "filetype": "2",
+        "ukey": "u-key", "serviceno": "service", "ivrtemplateid": "200",
+        "retryatmpt": "0", "retryduration": "15",
+        "msisdnlist": [{"phoneno": "+919876543210", "param1": stream_url}],
+    }
+    assert result.request["msisdnlist"][0]["param1"] == "[redacted]"
+    assert result.body["body"]["echo"]["msisdnlist"][0]["param1"] == "[redacted]"
+    assert "private-once" not in json.dumps(result.body) + json.dumps(result.request)
+    assert "u-key" not in json.dumps(result.body) + json.dumps(result.request)
 
 
-def test_redacted_dial_request_never_retains_dynamic_wss_token():
-    redacted = redacted_payload({"ukey": "secret", "msisdnlist": [{"phoneno": "+91", "WSS": "wss://x/?token=one-use"}]})
+@pytest.mark.parametrize("field", ["param1", "PARAM1", "WSS"])
+def test_redacted_dial_request_never_retains_dynamic_wss_token(field):
+    redacted = redacted_payload({"ukey": "secret", "msisdnlist": [{"phoneno": "+91", field: "wss://x/?token=one-use"}]})
     assert "one-use" not in str(redacted) and redacted["ukey"] == "[redacted]"
+    assert redacted["msisdnlist"][0][field] == "[redacted]"
 
 
 def test_live_mode_rejects_static_or_disabled_calling_configuration(tmp_path):
