@@ -1,5 +1,6 @@
 """Bounded provider diagnostics: shape and approved values, never raw content."""
 
+import os
 import re
 from urllib.parse import parse_qs, urlsplit
 
@@ -29,12 +30,27 @@ REQUEST_KEYS = {"sourcetype", "sendnow", "campaigntype", "filetype", "ivrtemplat
                 "retryduration", "ukey", "serviceno", "phoneno", "param1", "recipient_count",
                 "phone_digits", "phone_format", "wss_scheme", "wss_route", "ukey_present",
                 "service_number_present", "phone_present", "param1_present", "token_present",
-                "wss_matches_public_base"}
+                "wss_matches_public_base", "debug_phone", "debug_wss_url"}
 RESPONSE_KEYS = {"status", "value", "reason_code", "body_type", "message_present", "error_present",
                  "call_id_present", "campaign_id_present", "item_count"}
 EVENT_KEYS = {"event", "sequence_number", "encoding", "sample_rate", "bit_depth", "bit_rate",
               "call_id_present", "stream_id_present", "account_id_present", "custom_parameters_present",
               "payload_present", "reason_present"}
+
+
+def _debug_stream_url(value: object) -> str | None:
+    """Keep only a canonical media address; discard all query values and credentials."""
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    try:
+        url = urlsplit(value)
+        if (url.scheme != "wss" or url.username is not None or url.password is not None
+                or not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]{1,5})?", url.netloc)
+                or not re.fullmatch(r"/calls/call_[a-f0-9]{36}", url.path)):
+            return None
+        return f"wss://{url.netloc}{url.path}?token=[redacted]"
+    except ValueError:
+        return None
 
 
 def safe_summary(kind: str, value: object) -> dict:
@@ -45,6 +61,16 @@ def safe_summary(kind: str, value: object) -> dict:
     result = {}
     for key, item in value.items():
         if key not in allowed:
+            continue
+        if key in {"debug_phone", "debug_wss_url"}:
+            if os.getenv("LOG_PROVIDER_DESTINATION", "false").lower() != "true":
+                continue
+            if key == "debug_phone" and isinstance(item, str) and re.fullmatch(r"\+?[0-9]{8,15}", item):
+                result[key] = item
+            elif key == "debug_wss_url":
+                sanitized = _debug_stream_url(item)
+                if sanitized is not None:
+                    result[key] = sanitized
             continue
         if (
             (key in SUMMARY_ENUMS and isinstance(item, str) and item in SUMMARY_ENUMS[key])
@@ -79,6 +105,8 @@ def obd_request_summary(payload: dict, expected_base: str) -> dict:
                       wss_matches_public_base=(url.scheme, url.netloc) == (expected.scheme, expected.netloc))
     except (TypeError, ValueError):
         result.update(wss_scheme="other", wss_route="unknown", token_present=False, wss_matches_public_base=False)
+    if os.getenv("LOG_PROVIDER_DESTINATION", "false").lower() == "true":
+        result.update(debug_phone=phone, debug_wss_url=stream)
     return safe_summary("provider_request", result)
 
 

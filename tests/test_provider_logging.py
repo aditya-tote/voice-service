@@ -19,6 +19,38 @@ from voice_harness.observability import SafeJsonFormatter, log_event
 from voice_harness.vih_media import create_vih_media_app
 
 
+def test_destination_debug_is_opt_in_and_masks_url_secrets(monkeypatch):
+    phone = "9876543210"
+    address = "wss://bridge.example.com/calls/call_" + "a" * 36
+    payload = {"ukey": "private-key", "msisdnlist": [{
+        "phoneno": phone, "param1": address + "?token=private-token&password=private-password",
+    }]}
+    monkeypatch.delenv("LOG_PROVIDER_DESTINATION", raising=False)
+    assert "debug_phone" not in obd_request_summary(payload, "wss://bridge.example.com")
+    monkeypatch.setenv("LOG_PROVIDER_DESTINATION", "true")
+    summary = obd_request_summary(payload, "wss://bridge.example.com")
+    record = logging.LogRecord("voice_harness", logging.INFO, "", 0, "", (), None)
+    record.safe_event = {"event": "obd_request", "provider_request": summary}
+    rendered = SafeJsonFormatter().format(record)
+    output = json.loads(rendered)["provider_request"]
+    assert output["debug_phone"] == phone
+    assert output["debug_wss_url"] == address + "?token=[redacted]"
+    assert all(secret not in rendered for secret in ("private-key", "private-token", "private-password"))
+    monkeypatch.setenv("LOG_PROVIDER_DESTINATION", "false")
+    output = json.loads(SafeJsonFormatter().format(record))["provider_request"]
+    assert "debug_phone" not in output and "debug_wss_url" not in output
+
+
+@pytest.mark.parametrize("url", [
+    "wss://user:secret@bridge.example.com/calls/call_" + "a" * 36,
+    "wss://bridge.example.com/private-secret?token=secret",
+    "wss://bridge.example.com/\nsecret",
+])
+def test_destination_debug_rejects_noncanonical_urls(monkeypatch, url):
+    monkeypatch.setenv("LOG_PROVIDER_DESTINATION", "true")
+    assert "debug_wss_url" not in safe_summary("provider_request", {"debug_wss_url": url})
+
+
 def test_obd_summaries_keep_fixed_diagnostics_and_discard_provider_content():
     request = {
         "ukey": "provider-secret", "sourcetype": "1", "sendnow": "0", "campaigntype": "4",
