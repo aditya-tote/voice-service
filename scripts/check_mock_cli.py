@@ -140,10 +140,19 @@ def run():
                 assert restored["complete"] is True and restored["simulated"] is True
                 status, replay = request("/v1/calls", payload, idem)
                 assert status == 202 and replay["callId"] == call_id
+                log.flush()
+                log_text = (task_dir / "server.log").read_text(encoding="utf-8")
+                events = [json.loads(line) for line in log_text.splitlines()]
+                assert any(event["event"] == "service_starting" for event in events)
+                assert any(event["event"] == "call_created" and event["call_id"] == call_id for event in events)
+                assert any(event["event"] == "api_request_failed" and event["status_code"] == 401 for event in events)
+                for private in (KEY, idem, payload["customerPhone"], payload["script"],
+                                "bridge.example.com", "Traceback"):
+                    assert private not in log_text, "sensitive data appeared in CLI logs"
                 print(json.dumps({
                     "checks": ["actual CLI HTTP", "no controller config", "auth rejection",
                                "idempotent replay", "conflict rejection", "raw JSON result",
-                               "restart persistence", "replay after restart"],
+                               "restart persistence", "replay after restart", "safe structured CLI logs"],
                     "result": restored,
                 }, indent=2))
             finally:

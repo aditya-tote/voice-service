@@ -1,7 +1,10 @@
 import asyncio
 import json
+import logging
+import time
 from importlib.util import find_spec
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -9,6 +12,7 @@ from fastapi.responses import JSONResponse
 from .auth import bearer_value, matches
 from .call_service import CallService
 from .models import Brief, Cdr, CreatedSession, SessionStatus, StartCall, StartCallResponse
+from .observability import error_type, log_event, request_id_context
 from .session_store import SessionStore, StoreError
 
 
@@ -48,6 +52,32 @@ def create_controller_app(store: SessionStore, calls: CallService | None = None,
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.middleware("http")
+    async def request_logging(request: Request, call_next):
+        identifier = uuid4().hex
+        context = request_id_context.set(identifier)
+        started = time.monotonic()
+        status_code = 500
+        failure = None
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-ID"] = identifier
+            return response
+        except Exception as error:
+            failure = error_type(error)
+            raise
+        finally:
+            # Only the router's fixed template is eligible for logging, never the URL.
+            route = getattr(request.scope.get("route"), "path", "unknown")
+            log_event("api_request_failed" if status_code >= 400 else "api_request_finished",
+                      logging.ERROR if status_code >= 500 else logging.WARNING if status_code >= 400 else logging.INFO,
+                      request_id=identifier, route=route, method=request.method,
+                      call_id=request.path_params.get("call_id"), status_code=status_code,
+                      stage="http", error_type=failure,
+                      duration_ms=round((time.monotonic() - started) * 1000, 2))
+            request_id_context.reset(context)
 
     async def authorize(authorization: str | None = Header(default=None)) -> None:
         if not matches(store.settings.bridge_api_key, bearer_value(authorization)):

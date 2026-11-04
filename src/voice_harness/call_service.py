@@ -1,6 +1,7 @@
 """Call-intent service shared by a manual caller and a future agent tool."""
 
 import asyncio
+import logging
 import secrets
 from datetime import datetime
 from importlib.util import find_spec
@@ -8,6 +9,7 @@ from urllib.parse import urlsplit
 
 from .config import Settings
 from .models import StartCall, StartCallResponse
+from .observability import call_id_context, error_type, log_event
 from .repository import CallRepository, RepositoryError
 from .vih_client import VihClient, provider_phone
 
@@ -19,6 +21,18 @@ class CallService:
         self.vih = VihClient(settings)
 
     async def start(self, request: StartCall, key: str) -> StartCallResponse:
+        context = call_id_context.set(None)
+        try:
+            return await self._start(request, key)
+        except Exception as error:
+            log_event("call_start_failed", logging.WARNING if isinstance(error, RepositoryError) else logging.ERROR,
+                      stage="call_start", error_type=error_type(error),
+                      status_code=error.status if isinstance(error, RepositoryError) else 500)
+            raise
+        finally:
+            call_id_context.reset(context)
+
+    async def _start(self, request: StartCall, key: str) -> StartCallResponse:
         if request.voiceName not in self.settings.allowed_voices:
             raise RepositoryError(422, "voiceName is not allowed")
         if self.settings.vih_dial_mode == "live":
@@ -28,14 +42,20 @@ class CallService:
                 raise RepositoryError(422, str(error)) from None
         raw = request.model_dump(mode="json")
         record, replay = self.repository.create_or_replay(key, raw, self.settings.vih_dial_mode == "mock")
+        call_id_context.set(record["id"])
+        log_event("call_replayed" if replay else "call_created", state=record["state"],
+                  simulated=self.settings.vih_dial_mode == "mock")
         if not replay:
             if self.settings.vih_dial_mode == "live" and not self.repository.acquire_gpu(record["id"]):
                 self.repository.update(record["id"], state="failed", dial_status="gpu_unavailable")
+                log_event("call_rejected", logging.WARNING, reason="gpu_unavailable", state="failed")
             else:
                 if self.settings.vih_dial_mode == "live":
                     if not await self._runtime_ready():
                         self.repository.update(record["id"], state="failed", dial_status="runtime_not_ready", gpu_lease=0)
+                        log_event("call_rejected", logging.ERROR, stage="runtime", reason="runtime_not_ready", state="failed")
                         final = self.repository.get(record["id"])
+                        log_event("call_start_finished", state=final["state"], simulated=False)
                         return StartCallResponse(callId=record["id"], state=final["state"], simulated=False,
                                                  resultUrl=f"/v1/calls/{record['id']}", createdAt=datetime.fromisoformat(final["created_at"]))
                     token = secrets.token_urlsafe(32)
@@ -58,6 +78,7 @@ class CallService:
                         campaign_id=self.vih.response_id(self.settings.vih_response_campaign_id_path, result.body) if self.settings.vih_response_campaign_id_path else None,
                     )
         final = self.repository.get(record["id"])
+        log_event("call_start_finished", state=final["state"], simulated=bool(final["simulated"]))
         return StartCallResponse(callId=record["id"], state=final["state"], simulated=bool(final["simulated"]),
                                  resultUrl=f"/v1/calls/{record['id']}", createdAt=datetime.fromisoformat(final["created_at"]))
 
@@ -65,7 +86,9 @@ class CallService:
         return self.repository.result(call_id)
 
     def cdr(self, payload: dict) -> tuple[str | None, bool]:
-        return self.repository.save_cdr(payload)
+        call_id, duplicate = self.repository.save_cdr(payload)
+        log_event("cdr_received", call_id=call_id, duplicate=duplicate, matched=call_id is not None)
+        return call_id, duplicate
 
     async def claim_media(self, call_id: str, token: str) -> StartCall:
         call = self.repository.claim_media(call_id, token)
@@ -83,6 +106,7 @@ class CallService:
 
     async def _runtime_ready(self) -> bool:
         if any(find_spec(name) is None for name in ("websockets", "numpy", "soxr", "sphn")):
+            log_event("runtime_check_failed", logging.ERROR, stage="runtime", reason="runtime_dependencies_missing")
             return False
         url = urlsplit(self.settings.personaplex_url)
         try:
@@ -92,5 +116,7 @@ class CallService:
             writer.close()
             await writer.wait_closed()
             return True
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError) as error:
+            log_event("runtime_check_failed", logging.ERROR, stage="runtime", reason="model_unreachable",
+                      error_type=error_type(error))
             return False

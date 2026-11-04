@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -10,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 
 from .config import Settings
+from .observability import error_type, log_event
 
 HTTP_DEADLINE_SECONDS = 15.0
 
@@ -84,7 +87,10 @@ class VihClient:
         return value if isinstance(value, str) and value else None
 
     async def dial(self, phone: str, wss_value: str | None = None) -> DialResult:
+        started = time.monotonic()
+        log_event("dial_started", stage="obd", dial_mode=self.settings.vih_dial_mode)
         if self.settings.vih_dial_mode == "mock":
+            log_event("dial_finished", stage="obd", reason="simulated", simulated=True)
             return DialResult("simulated", {"mode": "mock", "accepted": True}, {"mode": "mock"})
         payload = dial_payload(self.settings, phone, wss_value)
         redacted = redacted_payload(payload)
@@ -104,11 +110,20 @@ class VihClient:
                 token = parse_qs(urlsplit(wss_value or "").query).get("token", [""])[0]
                 body = _safe_response(content, (self.settings.vih_ukey, self.settings.vih_wss_value,
                                                 wss_value or "", token))
+                log_event("dial_finished" if response.is_success and not oversized else "dial_failed",
+                          logging.INFO if response.is_success and not oversized else logging.ERROR,
+                          stage="obd", status_code=response.status_code,
+                          reason="response_too_large" if oversized else "submitted" if response.is_success else "http_error",
+                          duration_ms=round((time.monotonic() - started) * 1000, 2))
                 # A non-2xx response after POST can still have created a campaign; keep it unknown.
                 return DialResult("submitted" if response.is_success and not oversized else "unknown",
                                   {"httpStatus": response.status_code, "body": body,
                                    "truncated": oversized}, redacted)
         except (httpx.TimeoutException, TimeoutError):
+            log_event("dial_failed", logging.ERROR, stage="obd", reason="timeout",
+                      error_type="TimeoutError", duration_ms=round((time.monotonic() - started) * 1000, 2))
             return DialResult("unknown", {"error": "timeout"}, redacted)
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            log_event("dial_failed", logging.ERROR, stage="obd", reason="network",
+                      error_type=error_type(error), duration_ms=round((time.monotonic() - started) * 1000, 2))
             return DialResult("unknown", {"error": "network"}, redacted)

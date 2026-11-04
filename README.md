@@ -56,6 +56,27 @@ set -a; . ./.env; set +a
 
 Use one worker. `GET /health/ready` verifies runtime packages and the local PersonaPlex TCP port only; it does not prove a model can produce audio. Run `voice-harness-probe NATF2.pt` on the GPU VM before a controlled phone test.
 
+## Logs and call troubleshooting
+
+VAH writes structured JSON events to standard output with a UTC `timestamp`, `level`, `event`, and applicable `call_id`, `stage`, `state`, `reason`, `error_type` or fixed `error_code`, plus safe counters such as `duration_ms`. HTTP responses include a generated `X-Request-ID`; its `request_id` links the request outcome to call creation and dialing logs. Use the `call_id` returned by `POST /v1/calls` to follow a call through dialing, WSS, PersonaPlex, and completion or recovery.
+
+Set `LOG_LEVEL=INFO` for normal operation: first incoming/outgoing audio events and progress counters every ten seconds show that the stream is active. `LOG_LEVEL=DEBUG` adds checkpoint counters every two seconds. Logs omit request bodies, phone numbers, scripts, prompts, audio, tokens, URLs, authorization headers, ViH credentials, and exception text. Dependency messages and tracebacks become generic component/severity events. Set `WARNING` or `ERROR` to reduce output.
+
+On the GPU VM, retain a live copy while running the service:
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/voice-harness 2>&1 | tee -a voice-harness.log
+```
+
+If VAH is run through `systemd`, inspect the same events with:
+
+```bash
+journalctl -u voice-harness -f -o cat
+```
+
+Use the logged `stage` and `reason` to locate a failure: `runtime` means the local audio/model prerequisite check; `obd` is the ViH dial request; `media_auth` and `provider_handshake` are the ViH WebSocket lifecycle; and `model_connect` is the PersonaPlex connection. The durable raw result remains available from `GET /v1/calls/{callId}`.
+
 The probe streams paced silence continuously while receiving model output and decoding it back to PCM. Its output deadline is 30 seconds after the handshake by default; `voice-harness-probe NATF2.pt --timeout 45` changes it. A timeout reports sent Opus packets, received audio, decoded bytes and text frame counts. Silence does not guarantee a spoken response, so inspect model logs if audio arrives without text. The earlier 60 ms input burst was insufficient for a streaming test.
 
 ## Enabling ViH only after provider confirmation
@@ -107,6 +128,7 @@ python scripts/check_mock_cli.py
 | `MEDIA_HOST`, `MEDIA_PORT` | `127.0.0.1`, `8081` | Loopback ViH WebSocket listener reached only through Nginx. |
 | `PUBLIC_STREAM_BASE_URL` | `wss://bridge.example.com` | Public TLS origin used in the dynamic ViH WSS URL. |
 | `BRIDGE_API_KEY` | required | At least 32-character caller/agent bearer secret. |
+| `LOG_LEVEL` | `INFO` | Structured stdout log threshold: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Logs intentionally omit payloads, phone numbers, scripts, audio, tokens, URLs, and credentials. |
 | `MEDIA_AUTH_MODE` | `header` | Legacy session media mode; live ViH requires `query`. |
 | `SESSION_TTL_SECONDS`, `MAX_STORED_SESSIONS` | `300`, `1000` | Legacy in-memory session bounds. |
 | `PERSONAPLEX_URL`, `ALLOWED_VOICES` | local URL, required | Local model endpoint and allowlisted `.pt` voice names. |
@@ -131,6 +153,6 @@ The OBD HTTP client has a 15-second overall deadline, bounded response storage, 
 
 Playback `mark` acknowledgements are counted, and `clear` framing is supported and used during failure teardown. Full interruption handling still needs a caller-VAD/model-reset policy; it is not enabled automatically. No audio is emitted after the provider's `stop`, so queued audio and a residual final fragment are discarded at call termination.
 
-Local verification: 76 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
+Local verification: 83 tests passed, 2 runtime-dependent test modules skipped, Ruff and compile checks passed, and the actual CLI/HTTP/restart smoke check passed, including safe JSON output assertions. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM. See `../docs/qa/voice-harness-poc-verification.json` for coverage and limits.
 
 Nginx must proxy `/calls/` to `MEDIA_HOST:MEDIA_PORT`. Proxy `/webhooks/vih/cdr` to the actual `CONTROL_HOST:CONTROL_PORT` only when CDR is enabled; edit the example's loopback target if the control listener is bound to the GPU VM Tailscale address.

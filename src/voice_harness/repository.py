@@ -2,12 +2,15 @@
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from .observability import log_event
 
 
 class RepositoryError(Exception):
@@ -55,12 +58,14 @@ class CallRepository:
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_campaign_id_unique ON calls(campaign_id) WHERE campaign_id IS NOT NULL")
-        self.connection.execute(
+        recovered = self.connection.execute(
             "UPDATE calls SET state='recovery_required', recovery_required=1, gpu_lease=1, stream_active=0, media_token_digest=NULL, updated_at=? "
             "WHERE gpu_lease=1 OR state IN ('dialing','dial_unknown','dial_submitted','connecting','live','stream_ended')",
             (_now(),),
         )
         self.connection.commit()
+        if recovered.rowcount:
+            log_event("recovery_detected", logging.WARNING, stage="database", recovered_calls=recovered.rowcount)
 
     @staticmethod
     def request_hash(request: dict[str, Any]) -> str:

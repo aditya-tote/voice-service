@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 import struct
 from urllib.parse import parse_qs, urlsplit
 
@@ -61,7 +62,8 @@ class Socket:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cdr_timing", ["disabled", "before_stop", "after_stop"])
-async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, monkeypatch, cdr_timing):
+async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, monkeypatch, cdr_timing, caplog):
+    caplog.set_level(logging.INFO, logger="voice_harness")
     config = settings(tmp_path, media_auth_mode="query", vih_dial_mode="live",
                       enable_live_dials=True, vih_obd_url="https://vih.example/dial",
                       vih_ukey="not-a-real-key", vih_service_no="service", vih_template_id="wss-template",
@@ -184,6 +186,15 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     assert clients[0].sent == [b"phone-opus"]
     assert calls.repository.get(call_id)["gpu_lease"] == 0
     assert token not in json.dumps(result)
+    events = [record.safe_event for record in caplog.records if record.name == "voice_harness"]
+    for name in ("call_created", "media_authorized", "stream_started", "model_connecting", "model_ready",
+                 "media_input_started", "media_output_started", "model_text_started", "media_finished"):
+        assert any(event["event"] == name and event["call_id"] == call_id for event in events)
+    assert any(event["event"] == "media_finished" and event["reason"] == "provider_stop"
+               and not event["recovery_required"] for event in events)
+    rendered_logs = json.dumps(events)
+    for private in (token, body()["customerPhone"], body()["script"], "Hello customer", "phone-opus"):
+        assert private not in rendered_logs
     with pytest.raises(RepositoryError):
         await calls.claim_media(call_id, token)
     calls.repository.connection.close()
@@ -197,7 +208,8 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["connect", "malformed", "cancel", "binary", "disconnect", "timeout", "invalid_stop"])
-async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, monkeypatch, failure):
+async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, monkeypatch, failure, caplog):
+    caplog.set_level(logging.INFO, logger="voice_harness")
     config = settings(tmp_path, idle_timeout_seconds=0.05 if failure == "timeout" else 60)
     calls = CallService(config)
     record, _ = calls.repository.create_or_replay("cleanup-1234", body(), False)
@@ -219,7 +231,7 @@ async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, mo
         async def connect(self):
             connected.set()
             if failure == "connect":
-                raise RuntimeError("model unavailable")
+                raise RuntimeError("wss://private.example/?token=do-not-log&text_prompt=secret-script")
 
         async def recv(self):
             if failure == "malformed":
@@ -260,6 +272,14 @@ async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, mo
     assert calls.repository.get(call_id)["gpu_lease"] == 1
     expected = {"cancel": "service_shutdown", "disconnect": "provider_disconnect", "timeout": "call_timeout"}
     assert result["streamReason"] == expected.get(failure, "bridge_error")
+    events = [record.safe_event for record in caplog.records if record.name == "voice_harness"]
+    errors = [event for event in events if event["event"] == "media_failed"]
+    assert errors and all(event["call_id"] == call_id for event in errors)
+    if failure != "timeout":
+        stages = {"connect": "model_connect", "malformed": "model_receive", "cancel": "shutdown"}
+        assert errors[0]["stage"] == stages.get(failure, "provider_receive")
+    assert any(event["event"] == "media_finished" and event["recovery_required"] for event in events)
+    assert "do-not-log" not in json.dumps(events) and "secret-script" not in json.dumps(events)
     calls.repository.connection.close()
 
 

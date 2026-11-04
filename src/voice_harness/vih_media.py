@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -15,11 +16,13 @@ from .audio import StreamingCodec
 from .auth import bearer_value
 from .call_service import CallService
 from .models import Brief, StartCall
+from .observability import error_code, error_type, log_event
 from .personaplex import PersonaPlexClient, prompt_for
 from .repository import RepositoryError
 from .vih_protocol import VihOutboundAudio, VihProtocolError, VihStream, mulaw_payload
 
 MEDIA_CHECKPOINT_SECONDS = 2.0
+MEDIA_LOG_SECONDS = 10.0
 
 
 def model_connection_url(base: str, request: StartCall) -> str:
@@ -84,8 +87,15 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
         try:
             request = await calls.claim_media(call_id, token or "")
         except RepositoryError as error:
+            log_event("media_rejected", logging.WARNING, call_id=call_id, stage="media_auth",
+                      status_code=error.status, error_type="RepositoryError")
             await socket.close(4401 if error.status == 401 else 4409)
             return
+        except Exception as error:
+            log_event("media_failed", logging.ERROR, call_id=call_id, stage="media_auth",
+                      error_type=error_type(error))
+            raise
+        log_event("media_authorized", call_id=call_id, stage="media_auth")
 
         protocol = VihStream(settings.max_frame_bytes)
         text: list[str] = []
@@ -96,6 +106,15 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
         started = time.monotonic()
         sent_frames = sent_bytes = 0
         send_lock = asyncio.Lock()
+        # Each concurrent direction retains its own failure stage.
+        failed_stage = "provider_handshake"
+
+        def progress(event: str, level: int = logging.INFO) -> None:
+            log_event(event, level, call_id=call_id,
+                      inbound_media_frames=protocol.media_frames, inbound_audio_bytes=protocol.audio_bytes,
+                      outbound_media_frames=sent_frames, outbound_audio_bytes=sent_bytes,
+                      sequence_gaps=protocol.sequence_gaps, agent_text_chars=text_chars,
+                      duration_ms=round((time.monotonic() - started) * 1000, 2))
 
         async def receive() -> str:
             message = await asyncio.wait_for(socket.receive(), settings.idle_timeout_seconds)
@@ -141,8 +160,18 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                 recorder.close()
             # The provider's validated terminal event remains authoritative even
             # if a model task fails or shutdown races with the same stop.
-            await calls.finish_media(call_id, "provider_stop" if protocol.stopped else reason,
-                                     "".join(text), stream_stats(), recording_refs())
+            final_reason = "provider_stop" if protocol.stopped else reason
+            try:
+                await calls.finish_media(call_id, final_reason, "".join(text), stream_stats(), recording_refs())
+            except Exception as error:
+                log_event("media_failed", logging.ERROR, call_id=call_id, stage="database",
+                          error_type=error_type(error))
+                raise
+            final = calls.repository.get(call_id)
+            log_event("media_finished", logging.INFO if protocol.stopped else logging.WARNING,
+                      call_id=call_id, reason=final_reason,
+                      state=final["state"], recovery_required=bool(final["recovery_required"]))
+            progress("media_progress")
             text.clear()
 
         try:
@@ -154,62 +183,122 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                         name, _ = protocol.ingest(await receive())
                         if name == "start":
                             await calls.bind_stream(call_id, protocol.last_event)
+                log_event("stream_started", call_id=call_id, stage="provider_handshake")
+                failed_stage = "codec"
                 codec = StreamingCodec()
+                failed_stage = "recording"
                 recorder = _Recordings(settings.recording_dir, call_id, settings.max_call_seconds * 8000)
+                failed_stage = "checkpoint"
                 await calls.checkpoint_media(call_id, "", protocol.stats(), recording_refs())
                 outbound = VihOutboundAudio(protocol.stream_sid)
                 client = PersonaPlexClient(model_connection_url(settings.personaplex_url, request),
                                            settings.ready_timeout_seconds)
+                failed_stage = "model_connect"
+                log_event("model_connecting", call_id=call_id, stage="model_connect")
                 await client.connect()
+                log_event("model_ready", call_id=call_id, stage="model_connect")
+                failed_stage = "media_session"
+
+                async def track(awaitable, stage: str):
+                    nonlocal failed_stage
+                    try:
+                        return await awaitable
+                    except Exception:
+                        failed_stage = stage
+                        raise
 
                 async def upstream() -> None:
-                    nonlocal reason
+                    nonlocal reason, failed_stage
                     while True:
-                        name, pcm = protocol.ingest(await receive())
+                        message = await track(receive(), "provider_receive")
+                        try:
+                            name, pcm = protocol.ingest(message)
+                        except Exception:
+                            failed_stage = "provider_receive"
+                            raise
                         if name == "stop":
                             reason = "provider_stop"
                             return
                         if pcm is not None:
-                            recorder.write("caller", mulaw_payload(protocol.last_event["media"]["payload"]))
-                            for packet in codec.phone_to_opus(pcm):
-                                await asyncio.wait_for(client.send_opus(packet), settings.idle_timeout_seconds)
+                            if protocol.media_frames == 1:
+                                log_event("media_input_started", call_id=call_id, stage="provider_receive")
+                            try:
+                                recorder.write("caller", mulaw_payload(protocol.last_event["media"]["payload"]))
+                            except Exception:
+                                failed_stage = "recording"
+                                raise
+                            try:
+                                packets = codec.phone_to_opus(pcm)
+                            except Exception:
+                                failed_stage = "audio_decode"
+                                raise
+                            for packet in packets:
+                                await track(asyncio.wait_for(client.send_opus(packet), settings.idle_timeout_seconds), "model_send")
 
                 async def downstream() -> None:
-                    nonlocal text_chars, sent_frames, sent_bytes
+                    nonlocal text_chars, sent_frames, sent_bytes, failed_stage
                     while True:
-                        frame = await asyncio.wait_for(client.recv(), settings.idle_timeout_seconds)
+                        frame = await track(asyncio.wait_for(client.recv(), settings.idle_timeout_seconds), "model_receive")
                         if not isinstance(frame, bytes) or len(frame) < 2:
+                            failed_stage = "model_receive"
                             raise VihProtocolError("malformed model frame")
                         if frame[0] == 2:
-                            piece = frame[1:].decode("utf-8")
-                            if text_chars + len(piece) > settings.max_transcript_chars:
-                                raise VihProtocolError("agent transcript limit exceeded")
+                            try:
+                                piece = frame[1:].decode("utf-8")
+                                if text_chars + len(piece) > settings.max_transcript_chars:
+                                    raise VihProtocolError("agent transcript limit exceeded")
+                            except Exception:
+                                failed_stage = "model_receive"
+                                raise
                             text.append(piece)
+                            if text_chars == 0 and piece:
+                                log_event("model_text_started", call_id=call_id, stage="model_receive")
                             text_chars += len(piece)
                         elif frame[0] == 1:
-                            pcm = codec.opus_to_phone(frame[1:])
-                            if len(pcm) > 80000:
-                                raise VihProtocolError("model audio frame too large")
-                            messages = outbound.encode(pcm)
+                            try:
+                                pcm = codec.opus_to_phone(frame[1:])
+                                if len(pcm) > 80000:
+                                    raise VihProtocolError("model audio frame too large")
+                                messages = outbound.encode(pcm)
+                            except Exception:
+                                failed_stage = "audio_decode"
+                                raise
                             for message in messages:
                                 if protocol.stopped:
                                     return
-                                await send(message)
+                                await track(send(message), "provider_send")
                                 # Retain the audio sent toward telephony, not an unplayed model buffer.
                                 data = mulaw_payload(json.loads(message)["media"]["payload"])
-                                recorder.write("agent", data)
+                                try:
+                                    recorder.write("agent", data)
+                                except Exception:
+                                    failed_stage = "recording"
+                                    raise
                                 sent_frames += 1
                                 sent_bytes += len(data)
+                                if sent_frames == 1:
+                                    log_event("media_output_started", call_id=call_id, stage="provider_send")
                             if messages and not protocol.stopped:
-                                await send(outbound.mark(f"audio-{outbound.chunk}"))
+                                await track(send(outbound.mark(f"audio-{outbound.chunk}")), "provider_send")
                         else:
+                            failed_stage = "model_receive"
                             raise VihProtocolError("unexpected model frame")
 
                 async def checkpoint() -> None:
+                    nonlocal failed_stage
+                    last_log = time.monotonic()
                     while True:
                         await asyncio.sleep(MEDIA_CHECKPOINT_SECONDS)
-                        recorder.flush()
-                        await calls.checkpoint_media(call_id, "".join(text), stream_stats(), recording_refs())
+                        try:
+                            recorder.flush()
+                            await calls.checkpoint_media(call_id, "".join(text), stream_stats(), recording_refs())
+                        except Exception:
+                            failed_stage = "checkpoint"
+                            raise
+                        progress("media_checkpoint", logging.DEBUG)
+                        if time.monotonic() - last_log >= MEDIA_LOG_SECONDS:
+                            progress("media_progress")
+                            last_log = time.monotonic()
 
                 tasks.extend((asyncio.create_task(upstream()), asyncio.create_task(downstream()),
                               asyncio.create_task(checkpoint())))
@@ -217,14 +306,20 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                 for task in done:
                     task.result()
         except WebSocketDisconnect:
-            pass
+            log_event("media_failed", logging.WARNING, call_id=call_id, stage="provider_receive",
+                      reason="provider_disconnect", error_type="WebSocketDisconnect")
         except TimeoutError:
             reason = "call_timeout"
+            log_event("media_failed", logging.ERROR, call_id=call_id, stage=failed_stage,
+                      reason="timeout", error_type="TimeoutError")
         except asyncio.CancelledError:
             reason = "service_shutdown"
+            log_event("media_failed", logging.WARNING, call_id=call_id, stage="shutdown", reason=reason)
             raise
-        except Exception:  # noqa: BLE001 - upstream errors can include prompt/token URLs
+        except Exception as error:  # noqa: BLE001 - upstream errors can include prompt/token URLs
             reason = "bridge_error"
+            log_event("media_failed", logging.ERROR, call_id=call_id, stage=failed_stage,
+                      reason=reason, error_type=error_type(error), error_code=error_code(error))
         finally:
             finishing = asyncio.create_task(cleanup())
             try:
@@ -236,6 +331,7 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
     @app.websocket("/stream")
     async def static_stream(socket: WebSocket) -> None:
         # The PDF doesn't define a trusted static-stream->our-call correlation contract.
+        log_event("media_rejected", logging.WARNING, stage="media_auth", status_code=403)
         await socket.close(4403)
 
     return app
