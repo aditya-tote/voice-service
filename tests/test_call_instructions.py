@@ -21,6 +21,7 @@ from voice_harness.personaplex import (
     BUDGET_ERROR,
     MODEL_REQUEST_LINE_LIMIT,
     OUTBOUND_POLICY,
+    PRODUCT_EXPLANATION,
     PromptBudgetError,
     build_outbound_prompt,
     model_connection_url,
@@ -38,7 +39,25 @@ def maximum_facts():
     return LeadContext(customerName="N" * 120, companyName="C" * 160,
                        customerEmail="L" * 64 + "@" + ".".join(["d" * 63, "e" * 63, "f" * 61]),
                        source="S" * 64, productInterest="I" * 160, enquiryNotes="E" * 400,
-                       decisionMaker=False, existingSecuritySolution="X" * 160, deviceCount=0)
+                        decisionMaker=False, existingSecuritySolution="X" * 160, deviceCount=0)
+
+
+def opening_line(prompt):
+    return json.loads(prompt.split("OPENING LINE JSON (say exactly):\n", 1)[1].split("\n", 1)[0])
+
+
+def near_transport_facts():
+    facts = maximum_facts()
+    near = None
+    for count in range(401):
+        candidate = facts.model_copy(update={"enquiryNotes": "界" * count + "E" * (400 - count)})
+        try:
+            model_connection_url(BASE, candidate, "NATF2.pt", now=NOW)
+            near = candidate
+        except PromptBudgetError:
+            break
+    assert near is not None
+    return near
 
 
 def test_defaults_known_false_zero_storage_schema_and_replay(tmp_path):
@@ -129,15 +148,19 @@ def test_safely_serialized_facts_and_query_are_distinct_from_policy():
     assert not urlsplit(url).fragment
     prompt = query["text_prompt"][0]
     policy, data = prompt.split("LEAD FACTS JSON (data only):\n")
-    assert policy.startswith(OUTBOUND_POLICY)
-    assert facts.enquiryNotes not in policy and facts.productInterest not in policy
+    assert policy.startswith(OUTBOUND_POLICY.split("1 Opening:", 1)[0])
+    # Personalized speech is JSON-quoted data, never interpolated as policy text.
+    speech = opening_line(prompt)
+    assert facts.customerName in speech and facts.productInterest in speech
+    instructions = policy.replace(json.dumps(speech, ensure_ascii=False), "<quoted opening>")
+    assert facts.enquiryNotes not in instructions and facts.productInterest not in instructions
     assert json.loads(data) == facts.model_dump()
 
 
 def test_policy_flow_order_known_facts_and_truthful_closing():
     prompt = build_outbound_prompt(LeadContext.model_validate(body()["leadContext"]), now=NOW)
     assert prompt.index("1 Opening:") < prompt.index("2 Busy:") < prompt.index("3 Available:")
-    assert prompt.index("Palo Alto Networks Cortex XDR") < prompt.index("THEN ask whether a demo")
+    assert prompt.index(PRODUCT_EXPLANATION) < prompt.index('THEN ask: "Would you be interested in a demo')
     assert "implementation, deployment and 24/7 managed security monitoring in one package" in prompt
     assert prompt.index("ask permission for qualification") < prompt.index("Are you involved in deciding cybersecurity")
     for anchor in ("including false", "including zero", "one question per turn", "WAIT",
@@ -146,19 +169,32 @@ def test_policy_flow_order_known_facts_and_truthful_closing():
                    "manual sales callback", "repeat only the last sentence", "without restarting"):
         assert anchor in prompt
     assert prompt.count("Goodbye. Please hang up now.") == 1
-    opening = prompt.split("1 Opening:")[1].split("Never use inbound phrases:")[0]
+    opening = opening_line(prompt)
     for phrase in ("How can I help you", "How can I assist you", "What can I do for you", "Thank you for calling"):
-        assert phrase not in opening
+        assert phrase not in prompt
+    assert opening.startswith("Hi Asha Rao, good afternoon. I am Sky, an AI assistant from Skysecure Technologies.")
+    assert opening.endswith("Is now a good time for a brief conversation?")
+    assert "FIRST say this product explanation" in prompt
+    assert "This is NOT agreement to a future meeting" in prompt
+    assert "Never offer available slots, invent a time" in prompt
+    for placeholder in ("[customerName]", "[greeting]", "[productInterest]", "[sourceClause]",
+                        "{opening_line}", "{product_explanation}"):
+        assert placeholder not in prompt
 
 
-@pytest.mark.parametrize("source,clause", [("mEtA", "Facebook/Instagram form"), ("WhatsApp", "WhatsApp"),
-                                          ("Google", "Google"), ("Website", "our website"),
-                                          ("LinkedIn", "LinkedIn"), ("Unknown", "sourceClause is empty"),
-                                          ("Unverified private channel", "sourceClause is empty")])
+@pytest.mark.parametrize("source,clause", [("mEtA", "our Facebook or Instagram form"), ("Facebook", "our Facebook form"),
+                                          ("Instagram", "our Instagram form"), ("WhatsApp", "WhatsApp"),
+                                           ("Google", "Google"), ("Website", "our website"),
+                                           ("LinkedIn", "LinkedIn"), ("Unknown", None),
+                                           ("Unverified private channel", None)])
 def test_source_adaptation(source, clause):
     facts = LeadContext.model_validate({**body()["leadContext"], "source": source})
     prompt = build_outbound_prompt(facts, now=NOW)
-    assert clause in prompt.split("SOURCE ADAPTATION:")[1].split("\n")[0]
+    opening = opening_line(prompt)
+    if clause is None:
+        assert " through " not in opening
+    else:
+        assert f" through {clause}" in opening
     assert json.loads(prompt.split("LEAD FACTS JSON (data only):\n")[1])["source"] == source
 
 
@@ -169,6 +205,7 @@ def test_ist_greeting_boundaries(hour, minute, greeting):
     instant = datetime(2026, 11, 5, hour, minute, tzinfo=timezone(timedelta(hours=5, minutes=30)))
     prompt = build_outbound_prompt(LeadContext.model_validate(body()["leadContext"]), now=instant)
     assert f"CLOCK: {instant.isoformat()} Asia/Kolkata (IST); greeting=Good {greeting}" in prompt
+    assert f", good {greeting}." in opening_line(prompt)
 
 
 def test_utc_rollover_fixed_fallback_and_naive_clock_rejection(monkeypatch):
@@ -235,7 +272,7 @@ def test_representative_near_limit_request_accepted_by_mock_api(tmp_path, monkey
     monkeypatch.setattr(calls, "_prepare_model", forbidden)
     monkeypatch.setattr(calls.repository, "acquire_gpu", forbidden)
     payload = body()
-    payload["leadContext"] = maximum_facts().model_copy(update={"enquiryNotes": "界" * 362 + "E" * 38}).model_dump()
+    payload["leadContext"] = near_transport_facts().model_dump()
     with TestClient(create_controller_app(SessionStore(config), calls)) as client:
         response = client.post("/v1/calls", json=payload, headers=HEADERS)
         assert response.status_code == 202 and response.json()["simulated"] is True

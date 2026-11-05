@@ -40,7 +40,7 @@ async def run_probe(
         raise ProbeError("timeout must be within 0-600 seconds and frame interval within 0-1 seconds")
     brief = Brief(
         leadId="probe", persona="A friendly assistant starting a brief microphone test",
-        goal="Start speaking now. Say hello and ask how you can help.", tone="calm",
+        goal="Start speaking now. Say: This is a voice connection test. Can you hear me clearly?", tone="calm",
         facts=[], limits=["Keep the greeting brief"], voiceName=voice,
     )
     client = PersonaPlexClient(

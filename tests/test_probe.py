@@ -2,6 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -41,6 +42,7 @@ def boundaries(monkeypatch, mode="normal"):
 
     class Client:
         def __init__(self, url, timeout):
+            self.url = url
             self.frames = asyncio.Queue()
             self.sent = 0
             self.closed = False
@@ -78,6 +80,9 @@ async def test_probe_continues_sending_past_initial_burst_and_decodes_response(m
     assert instances.codec.frames >= 24 and instances.model.sent >= 6
     assert result.decoded_pcm_bytes >= 320 and result.text_frames >= 1
     assert instances.model.closed and instances.codec.closed
+    prompt = parse_qs(urlsplit(instances.model.url).query)["text_prompt"][0]
+    assert "This is a voice connection test. Can you hear me clearly?" in prompt
+    assert "how you can help" not in prompt
     assert "PersonaPlex Opus and text frames received" in capsys.readouterr().out
 
 
