@@ -104,6 +104,14 @@ No webhook registration is needed for this mode. If completion reporting is need
 
 The provided ViH guide documents JSON WebSocket events with Base64 G.711 mu-law 8 kHz media. VAH includes a strict adapter for that protocol and the existing PersonaPlex codec boundary. A live stream is intentionally not enabled until ViH confirms how an OBD call maps to the public WSS path/credential. Customer transcription needs a separate STT provider, so the POC returns `customerTranscript: null`.
 
+### Call instructions and closing
+
+`POST /v1/calls` accepts `script` alone, `context` alone, or both. At least one must be non-null and valid. When supplied, context still requires `persona`, `goal`, and `tone`. The model receives only `script` when present; otherwise it receives formatted `context`. Both fields are still stored when supplied, but context is not appended to a script. Put all necessary facts and limits in the script when using it, including identity checks and opt-out rules. Nothing is automatically summarized or truncated. See [script-only example](examples/start-call-script-only.json).
+
+The voice prompt includes a short closing instruction: acknowledge when the caller asks to end or the conversation is finished, say "Goodbye. Please hang up now.", and do not claim the service disconnected the phone. This is model guidance, not automatic intent detection or a provider hangup command. The caller must hang up; the existing provider `stop`/CDR handling completes the call and releases its reservation.
+
+Long system prompts can delay PersonaPlex's ready handshake. Sending only one field removes duplication only if the resulting text is shorter. It does not make an unchanged long script initialize faster. Keep the model prompt concise and test it with the model-only probe before a phone call; the probe's built-in short prompt does not validate a different full call script. `PERSONAPLEX_READY_TIMEOUT_SECONDS` changes the wait deadline, not the model's processing speed.
+
 ## Routes
 
 | Route | Authentication | Purpose |

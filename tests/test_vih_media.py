@@ -107,7 +107,7 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     class Model:
         def __init__(self, url, timeout):
             prompt = parse_qs(urlsplit(url).query)["text_prompt"][0]
-            assert body()["script"] in prompt and body()["context"]["goal"] in prompt
+            assert body()["script"] in prompt and "Persona:" not in prompt
             self.frames, self.sent, self.closed = asyncio.Queue(), [], False
             clients.append(self)
 
@@ -325,9 +325,9 @@ def test_protocol_rejects_malformed_or_mismatched_events(bad):
         stream.ingest(event if isinstance(event, bytes) else json.dumps(event))
 
 
-def test_model_prompt_contains_script_and_context():
+def test_model_prompt_prefers_script_over_context():
     request = StartCall.model_validate(body())
     prompt = parse_qs(urlsplit(vih_media.model_connection_url("ws://localhost/api/chat?extra=value", request)).query)
     assert request.script in prompt["text_prompt"][0]
-    assert request.context.goal in prompt["text_prompt"][0]
+    assert "Persona:" not in prompt["text_prompt"][0]
     assert prompt["extra"] == ["value"]

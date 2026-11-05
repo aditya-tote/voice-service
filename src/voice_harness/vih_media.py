@@ -28,11 +28,20 @@ MEDIA_LOG_SECONDS = 10.0
 
 
 def model_connection_url(base: str, request: StartCall) -> str:
-    brief = Brief(leadId=request.leadId, voiceName=request.voiceName,
-                  **request.context.model_dump())
+    sections = []
+    if request.script is not None:
+        sections.append("Approved call script:\n" + request.script)
+    elif request.context is not None:
+        brief = Brief(leadId=request.leadId, voiceName=request.voiceName,
+                      **request.context.model_dump())
+        sections.append(prompt_for(brief))
+    sections.append(
+        "Call closing: When the caller asks to end or the conversation is finished, "
+        "briefly acknowledge and say: Goodbye. Please hang up now. "
+        "Do not claim you disconnected the call."
+    )
     split = urlsplit(base)
-    # The approved script accompanies the structured facts and behavioral limits.
-    prompt = prompt_for(brief) + "\n\nApproved call script:\n" + request.script
+    prompt = "\n\n".join(sections)
     query = dict(parse_qsl(split.query, keep_blank_values=True))
     query.update(voice_prompt=request.voiceName, text_prompt=prompt)
     return urlunsplit((split.scheme, split.netloc, split.path,

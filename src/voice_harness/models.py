@@ -1,9 +1,9 @@
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SessionState(StrEnum):
@@ -29,13 +29,25 @@ class CallContext(BaseModel):
 
 
 class StartCall(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(
+        extra="forbid", str_strip_whitespace=True,
+        json_schema_extra={"anyOf": [
+            {"required": ["script"], "properties": {"script": {"type": "string"}}},
+            {"required": ["context"], "properties": {"context": {"type": "object"}}},
+        ]},
+    )
     leadId: str = Field(min_length=1, max_length=4096)
     customerPhone: str = Field(pattern=r"^\+[1-9][0-9]{7,14}$")
-    script: str = Field(min_length=1, max_length=24000)
-    context: CallContext
+    script: str | None = Field(default=None, min_length=1, max_length=24000)
+    context: CallContext | None = None
     voiceName: str = Field(min_length=1, max_length=128)
     metadata: dict[str, str] = Field(default_factory=dict, max_length=25)
+
+    @model_validator(mode="after")
+    def instructions_required(self) -> Self:
+        if self.script is None and self.context is None:
+            raise ValueError("Provide a nonempty script or context (or both)")
+        return self
 
     @field_validator("metadata")
     @classmethod
