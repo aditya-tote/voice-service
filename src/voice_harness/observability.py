@@ -50,6 +50,7 @@ ENUMS = {
                    "audio_limit", "unclassified", "call_not_found", "invalid_media_token",
                    "media_unavailable", "static_endpoint_disabled"},
     "auth_mode": {"header", "query"},
+    "disposition": {"ANSWERED", "NO_ANSWER", "BUSY", "FAILED", "CANCELLED"},
     "config_field": {"BRIDGE_API_KEY", "CONTROLLER_API_KEY", "CONTROL_HOST", "MEDIA_HOST",
                      "MEDIA_AUTH_MODE", "PERSONAPLEX_URL", "PUBLIC_STREAM_BASE_URL",
                      "CONTROLLER_CALLBACK_BASE_URL", "ALLOWED_VOICES", "VIH_DIAL_MODE",

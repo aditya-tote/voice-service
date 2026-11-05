@@ -87,7 +87,8 @@ class CallService:
 
     def cdr(self, payload: dict) -> tuple[str | None, bool]:
         call_id, duplicate = self.repository.save_cdr(payload)
-        log_event("cdr_received", call_id=call_id, duplicate=duplicate, matched=call_id is not None)
+        log_event("cdr_received", call_id=call_id, duplicate=duplicate, matched=call_id is not None,
+                  disposition=payload.get("disposition"))
         return call_id, duplicate
 
     async def claim_media(self, call_id: str, token: str) -> StartCall:

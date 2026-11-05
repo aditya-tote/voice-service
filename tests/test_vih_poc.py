@@ -168,7 +168,43 @@ def test_live_audio_allows_disabled_cdr_but_enabled_cdr_keeps_auth_and_correlati
     assert config.vih_cdr_auth_mode == "disabled" and not config.vih_response_call_id_path
     with pytest.raises(ValueError, match="VIH_CDR_SECRET"):
         settings(tmp_path, **values, vih_cdr_auth_mode="bearer")
-    with pytest.raises(ValueError, match="response ID path"):
-        settings(tmp_path, **values, vih_cdr_auth_mode="bearer", vih_cdr_secret="c" * 32)
+    assert settings(tmp_path, **values, vih_cdr_auth_mode="bearer", vih_cdr_secret="c" * 32).enable_live_dials
     assert settings(tmp_path, **values, vih_cdr_auth_mode="query", vih_cdr_secret="c" * 32,
                     vih_response_campaign_id_path="/campaignId").enable_live_dials
+
+
+def test_live_query_cdr_without_response_id_is_durable_and_does_not_release_lease(tmp_path, caplog):
+    config = settings(tmp_path, media_auth_mode="query", vih_dial_mode="live", enable_live_dials=True,
+                      vih_obd_url="https://vih.example/dial", vih_ukey="private-provider-key",
+                      vih_service_no="service", vih_template_id="200", vih_campaign_type="4",
+                      vih_wss_value_mode="confirmed_dynamic",
+                      vih_wss_value="wss://bridge.example.com/calls/{callId}?token={token}",
+                      vih_cdr_auth_mode="query", vih_cdr_secret="c" * 32)
+    service = CallService(config)
+    record, _ = service.repository.create_or_replay("cdr-capture-test", body(), False)
+    service.repository.update(record["id"], state="recovery_required", gpu_lease=1, recovery_required=1)
+    client = TestClient(create_controller_app(SessionStore(config), service))
+    payload = {"event": "cdr", "callSid": "CA-unmatched-test", "disposition": "FAILED",
+               "disconnectReason": "private-provider-message", "to": "+919876543210"}
+    endpoint = "/webhooks/vih/cdr?token=" + config.vih_cdr_secret
+    assert client.post("/webhooks/vih/cdr?token=wrong", json=payload).status_code == 401
+    assert client.post(endpoint, json={}).status_code == 422
+    caplog.set_level(logging.INFO, logger="voice_harness")
+    response = client.post(endpoint, json=payload)
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "duplicate": False, "callId": None}
+    assert client.post(endpoint, json=payload).json()["duplicate"] is True
+    assert service.repository.get(record["id"])["gpu_lease"] == 1
+    assert service.repository.get(record["id"])["state"] == "recovery_required"
+    events = service.repository.connection.execute("SELECT * FROM provider_events").fetchall()
+    assert len(events) == 1 and events[0]["call_id"] is None
+    assert json.loads(events[0]["payload_json"]) == payload
+    rendered = "\n".join(SafeJsonFormatter().format(item) for item in caplog.records)
+    assert '"disposition":"FAILED"' in rendered and '"matched":false' in rendered
+    for secret in (config.vih_cdr_secret, "private-provider-message", "+919876543210", "CA-unmatched-test"):
+        assert secret not in rendered
+    service.repository.connection.close()
+    recovered = CallService(config)
+    assert recovered.repository.connection.execute("SELECT count(*) FROM provider_events").fetchone()[0] == 1
+    assert recovered.repository.get(record["id"])["gpu_lease"] == 1
+    recovered.repository.connection.close()
