@@ -24,6 +24,7 @@ def settings():
         frozenset({"NATF2.pt"}),
         "http://127.0.0.1:9000",
         "b" * 32,
+        database_path=":memory:",
     )
 
 

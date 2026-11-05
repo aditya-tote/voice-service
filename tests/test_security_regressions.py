@@ -29,6 +29,7 @@ def settings():
         allowed_voices=frozenset({"NATF2.pt"}),
         controller_callback_base_url="http://127.0.0.1:9000",
         controller_api_key="b" * 40,
+        database_path=":memory:",
     )
 
 

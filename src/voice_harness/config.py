@@ -54,6 +54,7 @@ class Settings:
     vih_response_campaign_id_path: str = ""
     recording_dir: str = ""
     vih_phone_format: str = "e164"
+    default_voice: str = "NATF2.pt"
 
     def __post_init__(self) -> None:
         if not _private_host(self.control_host) or self.media_host not in {"127.0.0.1", "::1"}:
@@ -124,6 +125,8 @@ class Settings:
             not re.fullmatch(r"[A-Za-z0-9_-]+\.pt", voice) for voice in self.allowed_voices
         ):
             raise ValueError("ALLOWED_VOICES must contain safe .pt filenames")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.pt", self.default_voice) or self.default_voice not in self.allowed_voices:
+            raise ValueError("Invalid default voice configuration")
         if self.vih_dial_mode not in {"mock", "live"}:
             raise ValueError("VIH_DIAL_MODE must be mock or live")
         if self.vih_phone_format not in {"e164", "india_national"}:
@@ -181,6 +184,7 @@ class Settings:
             max_stored_sessions=int(getenv("MAX_STORED_SESSIONS", "1000")),
             personaplex_url=getenv("PERSONAPLEX_URL", "ws://127.0.0.1:8998/api/chat"),
             allowed_voices=frozenset(filter(None, getenv("ALLOWED_VOICES", "").split(","))),
+            default_voice=getenv("DEFAULT_VOICE", "NATF2.pt"),
             controller_callback_base_url=getenv(
                 "CONTROLLER_CALLBACK_BASE_URL", "http://127.0.0.1:9000"
             ),

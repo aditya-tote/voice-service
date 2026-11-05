@@ -7,6 +7,8 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .auth import bearer_value, matches
@@ -21,6 +23,16 @@ def create_controller_app(store: SessionStore, calls: CallService | None = None,
     app = FastAPI(
         title="Voice Harness Control API", docs_url=None, redoc_url=None, openapi_url=None
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def call_validation_error(request: Request, error: RequestValidationError):
+        if request.method != "POST" or request.url.path != "/v1/calls":
+            return await request_validation_exception_handler(request, error)
+        # FastAPI's default includes raw input (sometimes the whole lead object)
+        # and validator context. Keep useful field diagnostics without lead facts.
+        # ASCII escaping also handles malformed Unicode in an extra field's path.
+        details = [{key: item[key] for key in ("type", "loc", "msg")} for item in error.errors()]
+        return Response(json.dumps({"detail": details}), status_code=422, media_type="application/json")
 
     @app.middleware("http")
     async def body_limit(request: Request, call_next):

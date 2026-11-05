@@ -29,9 +29,9 @@ def settings(tmp_path, **changes):
 
 
 def body():
-    return {"leadId": "lead", "customerPhone": "+919876543210", "script": "Introduce our product.",
-            "context": {"persona": "sales", "goal": "book", "tone": "calm", "facts": [], "limits": []},
-            "voiceName": "NATF2.pt", "metadata": {"source": "manual-poc"}}
+    return {"leadId": "lead", "customerPhone": "+919876543210",
+            "leadContext": {"customerName": "Asha Rao", "companyName": "Example Manufacturing",
+                            "customerEmail": "asha@example.com", "source": "Meta"}}
 
 
 def test_mock_call_is_durable_idempotent_and_safe(tmp_path):
@@ -43,7 +43,7 @@ def test_mock_call_is_durable_idempotent_and_safe(tmp_path):
     assert first.status_code == 202 and first.json()["simulated"]
     second = client.post("/v1/calls", headers=headers, json=body())
     assert second.json()["callId"] == first.json()["callId"]
-    changed = body(); changed["script"] = "different"
+    changed = body(); changed["leadContext"]["enquiryNotes"] = "Different requirement"
     assert client.post("/v1/calls", headers=headers, json=changed).status_code == 409
     result = client.get(first.json()["resultUrl"], headers=headers).json()
     assert result["complete"] and result["customerTranscript"] is None and "ukey" not in str(result).lower()

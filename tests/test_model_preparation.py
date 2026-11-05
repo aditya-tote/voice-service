@@ -1,6 +1,8 @@
 """A slow model must be ready before any telephone dial side effect."""
 
 import asyncio
+from dataclasses import replace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from test_vih_failures import live_settings
@@ -16,7 +18,8 @@ from voice_harness.vih_client import DialResult
 
 @pytest.fixture
 def prepared_service(tmp_path, monkeypatch):
-    calls = CallService(live_settings(tmp_path))
+    calls = CallService(replace(live_settings(tmp_path), default_voice="TEST.pt",
+                                allowed_voices=frozenset({"NATF2.pt", "TEST.pt"})))
     clients = []
     entering, ready = asyncio.Event(), asyncio.Event()
 
@@ -40,13 +43,16 @@ def prepared_service(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_waits_for_actual_ready_before_dial_and_reuses_the_same_session(prepared_service):
+async def test_waits_for_actual_ready_before_dial_and_reuses_the_same_session(prepared_service, monkeypatch):
     calls, clients, entering, ready = prepared_service
     dialed = []
 
     async def dial(*args):
         assert clients[0].connected
-        assert "Approved+call+script" in clients[0].url
+        query = parse_qs(urlsplit(clients[0].url).query)
+        assert "Cortex XDR" in query["text_prompt"][0]
+        assert "Asia/Kolkata" in query["text_prompt"][0]
+        assert query["voice_prompt"] == [calls.settings.default_voice]
         dialed.append(args)
         return DialResult("submitted", {})
 
@@ -60,6 +66,12 @@ async def test_waits_for_actual_ready_before_dial_and_reuses_the_same_session(pr
     ready.set()
     first = await task
     assert first.state == "dial_submitted" and len(dialed) == 1
+
+    def forbidden(*_, **__):
+        raise AssertionError("replay must not generate a new preparation artifact or clock")
+
+    monkeypatch.setattr(call_service, "model_connection_url", forbidden)
+    calls.settings = replace(calls.settings, default_voice="NATF2.pt")
     replay = await calls.start(request, "prepare-before-dial")
     assert replay.callId == first.callId and len(clients) == 1
     client = calls.take_prepared_model(first.callId)
@@ -69,6 +81,42 @@ async def test_waits_for_actual_ready_before_dial_and_reuses_the_same_session(pr
     with pytest.raises(PersonaPlexError):
         calls.take_prepared_model(first.callId)
     await client.close()
+    await calls.close()
+    calls.repository.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_preparation_exception_containing_full_url_and_facts_is_not_logged(prepared_service, caplog):
+    import logging
+
+    from voice_harness.observability import SafeJsonFormatter
+
+    calls, clients, _, _ = prepared_service
+    caplog.set_level(logging.INFO, logger="voice_harness")
+    request = StartCall.model_validate(body())
+
+    async def fail_connect():
+        raise RuntimeError(clients[0].url + str(request.leadContext.model_dump()))
+
+    async def forbidden(*_):
+        raise AssertionError("failed model preparation must not dial")
+
+    # Constructor is exercised normally; only its connection operation fails.
+    original_client = call_service.PersonaPlexClient
+
+    def failing_client(url, timeout):
+        client = original_client(url, timeout)
+        client.connect = fail_connect
+        return client
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(call_service, "PersonaPlexClient", failing_client)
+        calls.vih.dial = forbidden
+        response = await calls.start(request, "private-model-error")
+    assert response.state == "failed" and clients[0].closed
+    rendered = "\n".join(SafeJsonFormatter().format(record) for record in caplog.records)
+    for value in (clients[0].url, "text_prompt=", "POLICY (service-owned)", *body()["leadContext"].values()):
+        assert value not in rendered
     await calls.close()
     calls.repository.connection.close()
 

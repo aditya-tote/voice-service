@@ -22,7 +22,7 @@ In a second PowerShell window, load the same environment, then call it:
 
 ```powershell
 $headers = @{ Authorization = "Bearer $env:BRIDGE_API_KEY"; 'Idempotency-Key' = 'manual-poc-0001' }
-$payload = @{ leadId='lead_123'; customerPhone='+919876543210'; script='Introduce the approved offer and ask for a follow-up.'; context=@{persona='Sales representative';goal='Book a follow-up';tone='Calm and concise';facts=@('Asked about pricing');limits=@('Do not promise a discount')}; voiceName='NATF2.pt'; metadata=@{source='manual-poc'} } | ConvertTo-Json -Depth 5
+$payload = @{ leadId='lead_123'; customerPhone='+919876543210'; leadContext=@{customerName='Asha Rao';companyName='Example Manufacturing';customerEmail='asha@example.com';source='Meta';enquiryNotes='Interested in protection for business laptops.'} } | ConvertTo-Json -Depth 5
 $created = Invoke-RestMethod http://127.0.0.1:8080/v1/calls -Method POST -Headers $headers -ContentType application/json -Body $payload
 Invoke-RestMethod ("http://127.0.0.1:8080" + $created.resultUrl) -Headers $headers | ConvertTo-Json -Depth 8
 ```
@@ -37,7 +37,7 @@ curl --fail --request POST http://127.0.0.1:8080/v1/calls \
   --data-binary '@examples/start-call.json'
 ```
 
-The result contains `callId`, `simulated`, `state`, bounded dial data, provider IDs when known, CDR, `agentText`, `customerTranscript: null`, `complete`, and correlation status. A WSS-completed call without CDR reports `correlationStatus: "not_received"`; a received matching CDR reports `matched`. Reusing the same key and identical body returns the existing call. Changing the body with that key returns 409 and never creates another attempt.
+The result contains `callId`, `simulated`, `state`, bounded dial data, provider IDs when known, CDR, `agentText`, `customerTranscript: null`, `complete`, and correlation status. A WSS-completed call without CDR reports `correlationStatus: "not_received"`; a received matching CDR reports `matched`. Reusing the same key and canonical validated facts (including defaults) returns the existing call. Changing valid facts with that key returns 409 and never creates another attempt. See the breaking migration policy below for historical requests.
 
 Example mock result shape:
 
@@ -104,17 +104,47 @@ No webhook registration is needed for this mode. If completion reporting is need
 
 The provided ViH guide documents JSON WebSocket events with Base64 G.711 mu-law 8 kHz media. VAH includes a strict adapter for that protocol and the existing PersonaPlex codec boundary. A live stream is intentionally not enabled until ViH confirms how an OBD call maps to the public WSS path/credential. Customer transcription needs a separate STT provider, so the POC returns `customerTranscript: null`.
 
-### Call instructions and closing
+### Facts-only call contract (breaking revision 2.0.0)
 
-`POST /v1/calls` accepts `script` alone, `context` alone, or both. At least one must be non-null and valid. When supplied, context still requires `persona`, `goal`, and `tone`. The model receives only `script` when present; otherwise it receives formatted `context`. Both fields are still stored when supplied, but context is not appended to a script. Put all necessary facts and limits in the script when using it, including identity checks and opt-out rules. Nothing is automatically summarized or truncated. See [script-only example](examples/start-call-script-only.json).
+`POST /v1/calls` now accepts exactly `leadId`, `customerPhone`, and required `leadContext`. Extra top-level/nested fields are forbidden even if null. `script`, old `context`, `metadata`, `voiceName`, policy/persona and clock/timezone overrides return 422. See the [full example](examples/start-call.json), [minimal example](examples/start-call-minimal.json), and [API contract](../docs/api/voice-service-contract.md).
 
-The voice prompt includes a short closing instruction: acknowledge when the caller asks to end or the conversation is finished, say "Goodbye. Please hang up now.", and do not claim the service disconnected the phone. This is model guidance, not automatic intent detection or a provider hangup command. The caller must hang up; the existing provider `stop`/CDR handling completes the call and releases its reservation.
+| Field | Required / bounds |
+|---|---|
+| `leadId` | Trimmed nonblank string, <=4,096 characters; never sent to model. |
+| `customerPhone` | E.164 `^\+[1-9][0-9]{7,14}$`; never sent to model. Provider normalization remains separate. |
+| `leadContext.customerName` | Required nonblank string, 1–120 characters. |
+| `leadContext.companyName` | Required nonblank string, 1–160 characters. |
+| `leadContext.customerEmail` | Required ASCII mailbox, 3–254 characters; local part <=64, one @, dotted DNS domain, labels <=63/no edge hyphens. Common + tags/subdomains accepted; no whitespace, controls, quoted/Unicode forms or edge/consecutive local dots. Case preserved; syntax only. |
+| `leadContext.source` | Required nonblank string, 1–64; open vocabulary, including `Unknown`. |
+| `leadContext.productInterest` | Optional non-null nonblank string, 1–160; defaults to `managed endpoint security`. |
+| `leadContext.enquiryNotes` | Optional null or nonblank string, 1–400. |
+| `leadContext.decisionMaker` | Optional strict boolean or null; strings/numbers rejected. |
+| `leadContext.existingSecuritySolution` | Optional null or nonblank string, 1–160; explicit `None` text is a known fact. |
+| `leadContext.deviceCount` | Optional strict integer >=0 or null; booleans/fractions/numeric strings rejected. Zero is known. |
 
-Long system prompts can delay PersonaPlex's ready handshake. Sending only one field removes duplication only if the resulting text is shorter. It does not make an unchanged long script initialize faster. Keep the model prompt concise and test it with the model-only probe before a phone call; the probe's built-in short prompt does not validate a different full call script. `PERSONAPLEX_READY_TIMEOUT_SECONDS` changes the wait deadline, not the model's processing speed.
+All strings are trimmed. Model-bound strings reject control characters, including embedded newlines. Optional fields other than interest default to null. Facts are safely serialized separately from fixed policy and are treated as untrusted data; this is guidance, not a guarantee of model compliance.
 
-Live calls initialize the actual script and voice on PersonaPlex **before** sending the ViH dial request. The same ready WebSocket is handed to the media bridge when the phone connects; the bridge does not initialize a second model session. `PERSONAPLEX_PREPARE_TIMEOUT_SECONDS` (default 120) bounds this pre-dial preparation. If initialization fails, the call is marked `failed` / `runtime_not_ready`, the reservation is released, and ViH is not called. The delay occurs before the telephone rings, not while the caller waits on a silent line. This changes call ordering, not model inference speed or a guarantee of audio output.
+The service owns Sky's fixed Skysecure Technologies outbound flow: name/time/source enquiry follow-up and availability WAIT; busy manual callback request; if available, explanation of Palo Alto Networks Cortex XDR managed endpoint security with implementation, deployment and 24/7 managed monitoring **before** offering a demo/detailed discussion/assessment. Different interest remains a customer fact; other offerings need manual seller follow-up. A declined offer permits one alternate-requirement question; firm refusal/opt-out or denied enquiry closes immediately. Acceptance captures session type/date/time, then optional permission-based qualification one question per turn, skipping known facts (including false/zero) and avoiding confirmation of known name/company/email. Requested meetings are not booked: “Our team will confirm meeting details.” No STT, calendar, email, seller routing, or telephone hangup tool has been added. The single closing thanks the customer and says “Goodbye. Please hang up now.” Provider `stop`/CDR completes the actual call.
+
+`DEFAULT_VOICE=NATF2.pt` must be a safe `.pt` filename in `ALLOWED_VOICES`. The service samples actual preparation time in `Asia/Kolkata`, including ISO date/time and greeting: morning 05:00–11:59, afternoon 12:00–16:59, evening otherwise (including night). Windows without IANA data uses a stdlib fixed UTC+05:30 fallback for this India-only modern clock. Relative slots use that preparation timestamp; default IST, clarify ambiguous/past slots. Meta means Facebook/Instagram form; WhatsApp/Google/Website/LinkedIn use natural channel names. Unknown/unrecognized source uses generic enquiry follow-up, without inventing a channel.
+
+The entire assembled prompt must be strictly `<7000` characters. The exact percent-encoded ASCII URL **and** origin-form `GET <path>?<query> HTTP/1.1\r\n` must each be strictly `<8190` bytes, based on the recorded PersonaPlex parser limit. Unicode and punctuation can expand; fields are never silently truncated. Either budget failure returns generic `422: leadContext exceeds model prompt or transport budget` **before** saving, admission, model connection or dial in both mock/live modes. The 64 KiB JSON body cap also applies. A short probe does not validate this full prompt's inference behavior.
+
+Live calls build the artifact once and initialize that exact prompt URL and configured voice on PersonaPlex **before** sending the ViH dial request. The same ready WebSocket, including its preparation-time clock, is handed to the media bridge; a missing live preparation fails without reconnecting after answer. `PERSONAPLEX_PREPARE_TIMEOUT_SECONDS` (default 120) bounds this preparation. Failure marks the saved call `failed` / `runtime_not_ready`, releases admission, and does not call ViH. Preparation occurs before the telephone rings; this is not a guarantee of audio output.
 
 `POST /v1/calls` waits for preparation plus the provider submission. Give Postman and any HTTP proxy a timeout longer than that combined time (for the default preparation limit, allow at least 150 seconds). If the client times out, retry with the **same** idempotency key/body to find the existing attempt; a new key could create another call. A ready model session waits up to `SESSION_TTL_SECONDS` (default 300) for the provider stream. If that window expires, the model closes and its token is invalidated, but the telephone reservation remains `recovery_required` until its provider outcome is resolved. Matched terminal CDRs, definitive local dial failure, and shutdown also clean up unclaimed model connections.
+
+### Breaking migration and replay
+
+| After cutover | Behavior |
+|---|---|
+| New valid facts/new key | Normal submission. |
+| Same canonical facts/key, later clock/voice/policy configuration | Existing ID/current state, before clock sampling or prompt generation; no redial. Omitted interest and explicit default normalize identically. |
+| Old script/context POST, even a historical replay | 422 before replay lookup. |
+| New valid body/historical old key | 409; no row rewrite. |
+| GET historical call ID | Original raw historical request/evidence remains readable. |
+
+No request JSON/hash backfill or database migration is needed. Drain/reconcile old in-flight calls, model preparations and provider streams before deploying; old payloads cannot satisfy new media parsing and ready sessions are process-local. Restart invalidates tokens and retains uncertain-call recovery. Coordinate OpenClaw/tool-schema rollout: map known name/company/email/source into required facts, omit unknown optional facts or send supported nulls, inject bearer credentials externally, and keep stable attempt keys/call IDs. The producer adapter is external to this repository. If an old response/call ID is missing, reconcile through the pre-cutover/operator workflow before switching; obsolete POST cannot recover it and a fresh key must not bypass uncertainty.
 
 ## Routes
 
@@ -148,6 +178,7 @@ python scripts/check_mock_cli.py
 | `MEDIA_AUTH_MODE` | `header` | Legacy session media mode; live ViH requires `query`. |
 | `SESSION_TTL_SECONDS`, `MAX_STORED_SESSIONS` | `300`, `1000` | Legacy in-memory session bounds. |
 | `PERSONAPLEX_URL`, `ALLOWED_VOICES` | local URL, required | Local model endpoint and allowlisted `.pt` voice names. |
+| `DEFAULT_VOICE` | `NATF2.pt` | Service-owned outbound voice; safe filename and allowlist membership validated at startup. |
 | `DATABASE_PATH` | `voice-harness.sqlite3` | SQLite WAL file for durable POC state. |
 | `VIH_DIAL_MODE`, `ENABLE_LIVE_DIALS` | `mock`, `false` | Mock is safe; both must explicitly enable live dialing. |
 | `VIH_OBD_URL`, `VIH_UKEY`, `VIH_SERVICE_NO`, `VIH_TEMPLATE_ID` | example URL/template supplied; credentials empty | Account-specific OBD endpoint and credentials/settings. `.env.example` uses the supplied CreateOBDCampaignPost endpoint and template `200`; set explicitly for your account. |
@@ -169,6 +200,6 @@ The OBD HTTP client has a 15-second overall deadline, bounded response storage, 
 
 Playback `mark` acknowledgements are counted, and `clear` framing is supported and used during failure teardown. Full interruption handling still needs a caller-VAD/model-reset policy; it is not enabled automatically. No audio is emitted after the provider's `stop`, so queued audio and a residual final fragment are discarded at call termination.
 
-Local verification: see `../docs/qa/voice-harness-poc-verification.json` for current test counts, CLI/HTTP/restart checks and limits. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM.
+Local contract verification: see `../docs/api/voice-service.verification.json` for mock contract checks and measured prompt/URL/request-line budgets. `../docs/qa/voice-harness-poc-verification.json` preserves the earlier POC verification baseline. Native Opus/resampling and real ViH/PersonaPlex interoperability still require the GPU VM.
 
 Nginx must proxy `/calls/` to `MEDIA_HOST:MEDIA_PORT`. Proxy `/webhooks/vih/cdr` to the actual `CONTROL_HOST:CONTROL_PORT` only when CDR is enabled; edit the example's loopback target if the control listener is bound to the GPU VM Tailscale address.

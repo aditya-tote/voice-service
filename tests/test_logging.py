@@ -155,9 +155,9 @@ def test_start_call_http_request_emits_traceable_safe_event(tmp_path, caplog):
     client = TestClient(create_controller_app(SessionStore(config), CallService(config)))
     body = {
         "leadId": "lead-123", "customerPhone": "+919876543210",
-        "script": "Never emit this approved conversation script.",
-        "context": {"persona": "sales", "goal": "book", "tone": "calm", "facts": [], "limits": []},
-        "voiceName": "NATF2.pt", "metadata": {"source": "manual"},
+        "leadContext": {"customerName": "PrivateName", "companyName": "PrivateCompany",
+                        "customerEmail": "private@example.com", "source": "Meta",
+                        "enquiryNotes": "Never emit this approved conversation fact."},
     }
     caplog.set_level(logging.INFO, logger="voice_harness")
     response = client.post(
@@ -199,9 +199,10 @@ def test_http_lifecycle_logs_success_replay_client_errors_and_unhandled_error_wi
 
     headers = {"Authorization": "Bearer " + "a" * 32, "Idempotency-Key": "logging-http-0002"}
     body = {
-        "leadId": "lead-123", "customerPhone": "+919876543210", "script": "private script",
-        "context": {"persona": "sales", "goal": "book", "tone": "calm", "facts": [], "limits": []},
-        "voiceName": "NATF2.pt", "metadata": {"source": "manual"},
+        "leadId": "lead-123", "customerPhone": "+919876543210",
+        "leadContext": {"customerName": "PrivateName", "companyName": "PrivateCompany",
+                        "customerEmail": "private@example.com", "source": "Meta",
+                        "enquiryNotes": "private notes"},
     }
     caplog.set_level(logging.INFO, logger="voice_harness")
     client = TestClient(app, raise_server_exceptions=False)
@@ -212,6 +213,8 @@ def test_http_lifecycle_logs_success_replay_client_errors_and_unhandled_error_wi
     assert first.headers["X-Request-ID"] != replay.headers["X-Request-ID"]
     assert client.post("/v1/calls", headers={"Idempotency-Key": "logging-http-0002"}, json=body).status_code == 401
     assert client.post("/v1/calls", headers=headers, json={}).status_code == 422
+    invalid = {**body, "leadContext": {**body["leadContext"], "decisionMaker": "not-a-boolean"}}
+    assert client.post("/v1/calls", headers=headers, json=invalid).status_code == 422
 
     async def fail_start(*_):
         raise RuntimeError("https://secret.example/?token=one-use-token")
@@ -230,5 +233,6 @@ def test_http_lifecycle_logs_success_replay_client_errors_and_unhandled_error_wi
     assert any(event.get("error_type") == "RuntimeError" for event in failed)
     assert all(len(event["request_id"]) == 32 for event in events if "request_id" in event)
     rendered = "\n".join(record.getMessage() + str(record.safe_event) for record in caplog.records)
-    for secret in ("919876543210", "private script", "one-use-token", "secret.example", "Bearer " + "a" * 32):
+    for secret in ("919876543210", "PrivateName", "PrivateCompany", "private@example.com", "private notes",
+                   "one-use-token", "secret.example", "Bearer " + "a" * 32):
         assert secret not in rendered

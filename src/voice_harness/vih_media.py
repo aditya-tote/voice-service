@@ -188,7 +188,8 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                 if settings.vih_dial_mode == "live":
                     log_event("model_session_reused", call_id=call_id, stage="model_connect")
                 else:
-                    client = PersonaPlexClient(model_connection_url(settings.personaplex_url, request),
+                    client = PersonaPlexClient(model_connection_url(settings.personaplex_url, request.leadContext,
+                                                                   settings.default_voice),
                                                settings.ready_timeout_seconds)
                     log_event("model_connecting", call_id=call_id, stage="model_connect")
                     await client.connect()

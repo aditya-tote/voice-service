@@ -82,11 +82,9 @@ class CallRepository:
 
     def create_or_replay(self, key: str, request: dict[str, Any], simulated: bool) -> tuple[dict[str, Any], bool]:
         digest = self.request_hash(request)
-        found = self.connection.execute("SELECT * FROM calls WHERE idempotency_key=?", (key,)).fetchone()
+        found = self.lookup_replay(key, request)
         if found:
-            if found["request_hash"] != digest:
-                raise RepositoryError(409, "Idempotency-Key was already used with a different request")
-            return dict(found), True
+            return found, True
         now, identifier = _now(), "call_" + secrets.token_hex(18)
         self.connection.execute(
             "INSERT INTO calls (id,idempotency_key,request_hash,request_json,state,simulated,created_at,updated_at) "
@@ -95,6 +93,15 @@ class CallRepository:
         )
         self.connection.commit()
         return dict(self.connection.execute("SELECT * FROM calls WHERE id=?", (identifier,)).fetchone()), False
+
+    def lookup_replay(self, key: str, request: dict[str, Any]) -> dict[str, Any] | None:
+        """Nonmutating replay/conflict check before sampling clock or preparing a model."""
+        found = self.connection.execute("SELECT * FROM calls WHERE idempotency_key=?", (key,)).fetchone()
+        if found:
+            if found["request_hash"] != self.request_hash(request):
+                raise RepositoryError(409, "Idempotency-Key was already used with a different request")
+            return dict(found)
+        return None
 
     def get(self, call_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM calls WHERE id=?", (call_id,)).fetchone()

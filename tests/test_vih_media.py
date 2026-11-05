@@ -77,8 +77,8 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     calls = CallService(config)
     dialed = {}
 
-    async def ready(call_id, request):
-        client = Model(vih_media.model_connection_url(config.personaplex_url, request), 60)
+    async def ready(call_id, model_url):
+        client = Model(model_url, 60)
         await client.connect()
         calls._prepared_models[call_id] = client
         return True
@@ -110,7 +110,7 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     class Model:
         def __init__(self, url, timeout):
             prompt = parse_qs(urlsplit(url).query)["text_prompt"][0]
-            assert body()["script"] in prompt and "Persona:" not in prompt
+            assert body()["leadContext"]["customerName"] in prompt and "Persona:" not in prompt
             self.frames, self.sent, self.closed = asyncio.Queue(), [], False
             clients.append(self)
 
@@ -196,7 +196,7 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     assert any(event["event"] == "media_finished" and event["reason"] == "provider_stop"
                and not event["recovery_required"] for event in events)
     rendered_logs = json.dumps(events)
-    for private in (token, body()["customerPhone"], body()["script"], "Hello customer", "phone-opus"):
+    for private in (token, body()["customerPhone"], body()["leadContext"]["customerEmail"], "Hello customer", "phone-opus"):
         assert private not in rendered_logs
     with pytest.raises(RepositoryError):
         await calls.claim_media(call_id, token)
@@ -328,9 +328,33 @@ def test_protocol_rejects_malformed_or_mismatched_events(bad):
         stream.ingest(event if isinstance(event, bytes) else json.dumps(event))
 
 
-def test_model_prompt_prefers_script_over_context():
+def test_model_prompt_uses_service_policy_and_lead_facts():
     request = StartCall.model_validate(body())
-    prompt = parse_qs(urlsplit(vih_media.model_connection_url("ws://localhost/api/chat?extra=value", request)).query)
-    assert request.script in prompt["text_prompt"][0]
+    prompt = parse_qs(urlsplit(vih_media.model_connection_url(
+        "ws://localhost/api/chat?extra=value", request.leadContext, "NATF2.pt")).query)
+    assert request.leadContext.customerEmail in prompt["text_prompt"][0]
     assert "Persona:" not in prompt["text_prompt"][0]
     assert prompt["extra"] == ["value"]
+
+
+@pytest.mark.asyncio
+async def test_live_media_missing_prepared_session_fails_without_reconnecting(tmp_path, monkeypatch):
+    from test_vih_failures import live_settings
+
+    calls = CallService(live_settings(tmp_path))
+    record, _ = calls.repository.create_or_replay("missing-prepared-model", body(), False)
+    calls.repository.update(record["id"], state="dial_submitted", gpu_lease=1)
+    calls.repository.set_media_token(record["id"], "one-use-token")
+
+    def forbidden(*_, **__):
+        raise AssertionError("live media must not construct or connect another model")
+
+    monkeypatch.setattr(vih_media, "PersonaPlexClient", forbidden)
+    monkeypatch.setattr(vih_media, "model_connection_url", forbidden)
+    socket = Socket("one-use-token")
+    await vih_media.create_vih_media_app(calls).routes[0].endpoint(socket, record["id"])
+    result = calls.result(record["id"])
+    assert socket.closed and result["state"] == "recovery_required"
+    assert calls.repository.get(record["id"])["gpu_lease"] == 1
+    assert result["customerTranscript"] is None
+    calls.repository.connection.close()

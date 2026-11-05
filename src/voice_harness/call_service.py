@@ -11,7 +11,13 @@ from importlib.util import find_spec
 from .config import Settings
 from .models import StartCall, StartCallResponse
 from .observability import call_id_context, error_type, log_event
-from .personaplex import PersonaPlexClient, PersonaPlexError, model_connection_url
+from .personaplex import (
+    BUDGET_ERROR,
+    PersonaPlexClient,
+    PersonaPlexError,
+    PromptBudgetError,
+    model_connection_url,
+)
 from .repository import CallRepository, RepositoryError
 from .vih_client import VihClient, provider_phone
 
@@ -37,14 +43,22 @@ class CallService:
             call_id_context.reset(context)
 
     async def _start(self, request: StartCall, key: str) -> StartCallResponse:
-        if request.voiceName not in self.settings.allowed_voices:
-            raise RepositoryError(422, "voiceName is not allowed")
+        raw = request.model_dump(mode="json")
+        existing = self.repository.lookup_replay(key, raw)
+        if existing:
+            call_id_context.set(existing["id"])
+            log_event("call_replayed", state=existing["state"], simulated=bool(existing["simulated"]))
+            return StartCallResponse(callId=existing["id"], state=existing["state"], simulated=bool(existing["simulated"]),
+                                     resultUrl=f"/v1/calls/{existing['id']}", createdAt=datetime.fromisoformat(existing["created_at"]))
         if self.settings.vih_dial_mode == "live":
             try:
                 provider_phone(self.settings, request.customerPhone)
             except ValueError as error:
                 raise RepositoryError(422, str(error)) from None
-        raw = request.model_dump(mode="json")
+        try:
+            model_url = model_connection_url(self.settings.personaplex_url, request.leadContext, self.settings.default_voice)
+        except PromptBudgetError:
+            raise RepositoryError(422, BUDGET_ERROR) from None
         record, replay = self.repository.create_or_replay(key, raw, self.settings.vih_dial_mode == "mock")
         call_id_context.set(record["id"])
         log_event("call_replayed" if replay else "call_created", state=record["state"],
@@ -56,7 +70,7 @@ class CallService:
             else:
                 if self.settings.vih_dial_mode == "live":
                     try:
-                        ready = await self._prepare_model(record["id"], request)
+                        ready = await self._prepare_model(record["id"], model_url)
                     except asyncio.CancelledError:
                         await self.discard_prepared_model(record["id"])
                         self.repository.update(record["id"], state="failed", dial_status="runtime_not_ready", gpu_lease=0)
@@ -184,15 +198,14 @@ class CallService:
                 with suppress(Exception):
                     await asyncio.wait_for(client.close(), self.settings.close_timeout_seconds)
 
-    async def _prepare_model(self, call_id: str, request: StartCall) -> bool:
+    async def _prepare_model(self, call_id: str, model_url: str) -> bool:
         # Manual recovery may have released an older reservation without a CDR.
         for pending_id in list(self._prepared_models):
             await self.release_model_if_terminal(pending_id)
         if any(find_spec(name) is None for name in ("websockets", "numpy", "soxr", "sphn")):
             log_event("runtime_check_failed", logging.ERROR, stage="runtime", reason="runtime_dependencies_missing")
             return False
-        client = PersonaPlexClient(model_connection_url(self.settings.personaplex_url, request),
-                                   self.settings.personaplex_prepare_timeout_seconds)
+        client = PersonaPlexClient(model_url, self.settings.personaplex_prepare_timeout_seconds)
         started = time.monotonic()
         log_event("model_connecting", call_id=call_id, stage="model_connect")
         try:

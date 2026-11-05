@@ -1,0 +1,10 @@
+{
+  "leadId": "lead_123",
+  "customerPhone": "+12025550123",
+  "leadContext": {
+    "customerName": "Asha Rao",
+    "companyName": "Example Manufacturing",
+    "customerEmail": "asha@example.com",
+    "source": "Website"
+  }
+}

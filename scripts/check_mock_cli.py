@@ -58,6 +58,7 @@ def run():
             PUBLIC_STREAM_BASE_URL="wss://bridge.example.com",
             BRIDGE_API_KEY=KEY,
             ALLOWED_VOICES="NATF2.pt",
+            DEFAULT_VOICE="NATF2.pt",
             DATABASE_PATH=str(task_dir / "calls.sqlite3"),
             VIH_DIAL_MODE="mock",
             ENABLE_LIVE_DIALS="false",
@@ -103,16 +104,13 @@ def run():
         payload = {
             "leadId": "lead-local-acceptance",
             "customerPhone": "+919876543210",
-            "script": "Hello. This is a simulated local acceptance check.",
-            "context": {
-                "persona": "Sales representative",
-                "goal": "Ask for a follow-up",
-                "tone": "Calm",
-                "facts": ["No real call should occur"],
-                "limits": ["Do not dial a phone"],
+            "leadContext": {
+                "customerName": "Acceptance Customer",
+                "companyName": "Acceptance Company",
+                "customerEmail": "acceptance@example.com",
+                "source": "Website",
+                "enquiryNotes": "Synthetic local acceptance facts",
             },
-            "voiceName": "NATF2.pt",
-            "metadata": {"source": "local-acceptance"},
         }
         idem = "acceptance-" + uuid.uuid4().hex
         with (task_dir / "server.log").open("w", encoding="utf-8") as log:
@@ -124,7 +122,7 @@ def run():
                 call_id = created["callId"]
                 status, replay = request("/v1/calls", payload, idem)
                 assert status == 202 and replay["callId"] == call_id
-                changed = {**payload, "script": "Different payload"}
+                changed = {**payload, "leadContext": {**payload["leadContext"], "source": "Google"}}
                 assert request("/v1/calls", changed, idem)[0] == 409
                 status, result = request("/v1/calls/" + call_id)
                 assert status == 200 and result["simulated"] is True
@@ -146,7 +144,9 @@ def run():
                 assert any(event["event"] == "service_starting" for event in events)
                 assert any(event["event"] == "call_created" and event["call_id"] == call_id for event in events)
                 assert any(event["event"] == "api_request_failed" and event["status_code"] == 401 for event in events)
-                for private in (KEY, idem, payload["customerPhone"], payload["script"],
+                for private in (KEY, idem, payload["customerPhone"], payload["leadContext"]["customerName"],
+                                payload["leadContext"]["companyName"], payload["leadContext"]["customerEmail"],
+                                payload["leadContext"]["enquiryNotes"],
                                 "bridge.example.com", "Traceback"):
                     assert private not in log_text, "sensitive data appeared in CLI logs"
                 print(json.dumps({
