@@ -77,7 +77,10 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     calls = CallService(config)
     dialed = {}
 
-    async def ready():
+    async def ready(call_id, request):
+        client = Model(vih_media.model_connection_url(config.personaplex_url, request), 60)
+        await client.connect()
+        calls._prepared_models[call_id] = client
         return True
 
     async def dial(phone, wss=None):
@@ -85,7 +88,7 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
         dialed["wss"] = wss
         return DialResult("submitted", {"httpStatus": 200, "body": {"callSid": "CA-test"}})
 
-    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls, "_prepare_model", ready)
     monkeypatch.setattr(calls.vih, "dial", dial)
     clients, codecs = [], []
 
@@ -187,7 +190,7 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     assert calls.repository.get(call_id)["gpu_lease"] == 0
     assert token not in json.dumps(result)
     events = [record.safe_event for record in caplog.records if record.name == "voice_harness"]
-    for name in ("call_created", "media_authorized", "stream_started", "model_connecting", "model_ready",
+    for name in ("call_created", "media_authorized", "stream_started", "model_session_reused",
                  "media_input_started", "media_output_started", "model_text_started", "media_finished"):
         assert any(event["event"] == name and event["call_id"] == call_id for event in events)
     assert any(event["event"] == "media_finished" and event["reason"] == "provider_stop"

@@ -4,7 +4,7 @@ import logging
 from contextlib import suppress
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .models import Brief
+from .models import Brief, StartCall
 
 
 class PersonaPlexError(RuntimeError):
@@ -31,6 +31,25 @@ def connection_url(base_url: str, brief: Brief) -> str:
     split = urlsplit(base_url)
     query = dict(parse_qsl(split.query, keep_blank_values=True))
     query.update({"voice_prompt": brief.voiceName, "text_prompt": prompt_for(brief)})
+    return urlunsplit((split.scheme, split.netloc, split.path, urlencode(query), ""))
+
+
+def model_connection_url(base: str, request: StartCall) -> str:
+    sections = []
+    if request.script is not None:
+        sections.append("Approved call script:\n" + request.script)
+    elif request.context is not None:
+        brief = Brief(leadId=request.leadId, voiceName=request.voiceName,
+                      **request.context.model_dump())
+        sections.append(prompt_for(brief))
+    sections.append(
+        "Call closing: When the caller asks to end or the conversation is finished, "
+        "briefly acknowledge and say: Goodbye. Please hang up now. "
+        "Do not claim you disconnected the call."
+    )
+    split = urlsplit(base)
+    query = dict(parse_qsl(split.query, keep_blank_values=True))
+    query.update(voice_prompt=request.voiceName, text_prompt="\n\n".join(sections))
     return urlunsplit((split.scheme, split.netloc, split.path, urlencode(query), ""))
 
 

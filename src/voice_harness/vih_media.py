@@ -8,7 +8,6 @@ import re
 import time
 from contextlib import suppress
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -17,35 +16,13 @@ from .auth import bearer_value
 from .call_service import CallService
 from .diagnostics import stream_event_summary
 from .media_diagnostics import MediaConnectionLoggingMiddleware
-from .models import Brief, StartCall
 from .observability import error_code, error_type, log_event
-from .personaplex import PersonaPlexClient, prompt_for
+from .personaplex import PersonaPlexClient, model_connection_url
 from .repository import RepositoryError
 from .vih_protocol import VihOutboundAudio, VihProtocolError, VihStream, mulaw_payload
 
 MEDIA_CHECKPOINT_SECONDS = 2.0
 MEDIA_LOG_SECONDS = 10.0
-
-
-def model_connection_url(base: str, request: StartCall) -> str:
-    sections = []
-    if request.script is not None:
-        sections.append("Approved call script:\n" + request.script)
-    elif request.context is not None:
-        brief = Brief(leadId=request.leadId, voiceName=request.voiceName,
-                      **request.context.model_dump())
-        sections.append(prompt_for(brief))
-    sections.append(
-        "Call closing: When the caller asks to end or the conversation is finished, "
-        "briefly acknowledge and say: Goodbye. Please hang up now. "
-        "Do not claim you disconnected the call."
-    )
-    split = urlsplit(base)
-    prompt = "\n\n".join(sections)
-    query = dict(parse_qsl(split.query, keep_blank_values=True))
-    query.update(voice_prompt=request.voiceName, text_prompt=prompt)
-    return urlunsplit((split.scheme, split.netloc, split.path,
-                      urlencode(query), ""))
 
 
 class _Recordings:
@@ -187,6 +164,8 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
             text.clear()
 
         try:
+            if settings.vih_dial_mode == "live":
+                client = calls.take_prepared_model(call_id)
             await socket.accept()
             async with asyncio.timeout(settings.max_call_seconds):
                 # Handshake deadline is independent of repeated connected/idle messages.
@@ -205,12 +184,15 @@ def create_vih_media_app(calls: CallService) -> FastAPI:
                 failed_stage = "checkpoint"
                 await calls.checkpoint_media(call_id, "", protocol.stats(), recording_refs())
                 outbound = VihOutboundAudio(protocol.stream_sid)
-                client = PersonaPlexClient(model_connection_url(settings.personaplex_url, request),
-                                           settings.ready_timeout_seconds)
                 failed_stage = "model_connect"
-                log_event("model_connecting", call_id=call_id, stage="model_connect")
-                await client.connect()
-                log_event("model_ready", call_id=call_id, stage="model_connect")
+                if settings.vih_dial_mode == "live":
+                    log_event("model_session_reused", call_id=call_id, stage="model_connect")
+                else:
+                    client = PersonaPlexClient(model_connection_url(settings.personaplex_url, request),
+                                               settings.ready_timeout_seconds)
+                    log_event("model_connecting", call_id=call_id, stage="model_connect")
+                    await client.connect()
+                    log_event("model_ready", call_id=call_id, stage="model_connect")
                 failed_stage = "media_session"
 
                 async def track(awaitable, stage: str):

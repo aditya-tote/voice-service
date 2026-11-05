@@ -112,6 +112,10 @@ The voice prompt includes a short closing instruction: acknowledge when the call
 
 Long system prompts can delay PersonaPlex's ready handshake. Sending only one field removes duplication only if the resulting text is shorter. It does not make an unchanged long script initialize faster. Keep the model prompt concise and test it with the model-only probe before a phone call; the probe's built-in short prompt does not validate a different full call script. `PERSONAPLEX_READY_TIMEOUT_SECONDS` changes the wait deadline, not the model's processing speed.
 
+Live calls initialize the actual script and voice on PersonaPlex **before** sending the ViH dial request. The same ready WebSocket is handed to the media bridge when the phone connects; the bridge does not initialize a second model session. `PERSONAPLEX_PREPARE_TIMEOUT_SECONDS` (default 120) bounds this pre-dial preparation. If initialization fails, the call is marked `failed` / `runtime_not_ready`, the reservation is released, and ViH is not called. The delay occurs before the telephone rings, not while the caller waits on a silent line. This changes call ordering, not model inference speed or a guarantee of audio output.
+
+`POST /v1/calls` waits for preparation plus the provider submission. Give Postman and any HTTP proxy a timeout longer than that combined time (for the default preparation limit, allow at least 150 seconds). If the client times out, retry with the **same** idempotency key/body to find the existing attempt; a new key could create another call. A ready model session waits up to `SESSION_TTL_SECONDS` (default 300) for the provider stream. If that window expires, the model closes and its token is invalidated, but the telephone reservation remains `recovery_required` until its provider outcome is resolved. Matched terminal CDRs, definitive local dial failure, and shutdown also clean up unclaimed model connections.
+
 ## Routes
 
 | Route | Authentication | Purpose |

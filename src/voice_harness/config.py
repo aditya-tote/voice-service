@@ -37,6 +37,7 @@ class Settings:
     idle_timeout_seconds: float = 60.0
     close_timeout_seconds: float = 5.0
     max_call_seconds: int = 1800
+    personaplex_prepare_timeout_seconds: float = 120.0
     database_path: str = "voice-harness.sqlite3"
     vih_dial_mode: str = "mock"
     enable_live_dials: bool = False
@@ -79,7 +80,8 @@ class Settings:
                 )
             )
             or min(
-                self.ready_timeout_seconds, self.idle_timeout_seconds, self.close_timeout_seconds
+                self.ready_timeout_seconds, self.idle_timeout_seconds, self.close_timeout_seconds,
+                self.personaplex_prepare_timeout_seconds,
             )
             <= 0
         ):
@@ -185,6 +187,7 @@ class Settings:
             controller_api_key=getenv("CONTROLLER_API_KEY", ""),
             max_frame_bytes=int(getenv("MAX_FRAME_BYTES", "16384")),
             max_transcript_chars=int(getenv("MAX_TRANSCRIPT_CHARS", "32768")),
+            personaplex_prepare_timeout_seconds=float(getenv("PERSONAPLEX_PREPARE_TIMEOUT_SECONDS", "120")),
             ready_timeout_seconds=float(getenv("PERSONAPLEX_READY_TIMEOUT_SECONDS", "15")),
             idle_timeout_seconds=float(getenv("IDLE_TIMEOUT_SECONDS", "60")),
             close_timeout_seconds=float(getenv("CLOSE_TIMEOUT_SECONDS", "5")),

@@ -47,6 +47,7 @@ async def serve(settings: Settings) -> None:
     try:
         await asyncio.gather(control.serve(), media.serve())
     finally:
+        await calls.close()
         log_event("service_stopped", stage="shutdown")
 
 

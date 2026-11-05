@@ -58,6 +58,14 @@ class CallRepository:
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_campaign_id_unique ON calls(campaign_id) WHERE campaign_id IS NOT NULL")
+        # Dialing is persisted before the provider POST. A leased, still-created
+        # call crashed during model preparation and cannot have placed a call.
+        self.connection.execute(
+            "UPDATE calls SET state='failed', gpu_lease=0, recovery_required=0, "
+            "media_token_digest=NULL, dial_status='runtime_not_ready', updated_at=? "
+            "WHERE state='created' AND gpu_lease=1 AND dial_status IS NULL",
+            (_now(),),
+        )
         recovered = self.connection.execute(
             "UPDATE calls SET state='recovery_required', recovery_required=1, gpu_lease=1, stream_active=0, media_token_digest=NULL, updated_at=? "
             "WHERE gpu_lease=1 OR state IN ('dialing','dial_unknown','dial_submitted','connecting','live','stream_ended')",

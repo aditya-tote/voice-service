@@ -45,7 +45,7 @@ async def test_admission_before_await_prevents_concurrent_dials(tmp_path, monkey
     checking, proceed = asyncio.Event(), asyncio.Event()
     dial_count = 0
 
-    async def ready():
+    async def ready(*_):
         checking.set()
         await proceed.wait()
         return True
@@ -55,7 +55,7 @@ async def test_admission_before_await_prevents_concurrent_dials(tmp_path, monkey
         dial_count += 1
         return DialResult("unknown", {"error": "timeout"})
 
-    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls, "_prepare_model", ready)
     monkeypatch.setattr(calls.vih, "dial", dial)
     request = StartCall.model_validate(body())
     first = asyncio.create_task(calls.start(request, "concurrent-one"))
@@ -80,13 +80,13 @@ async def test_admission_before_await_prevents_concurrent_dials(tmp_path, monkey
 async def test_model_unavailable_never_dials(tmp_path, monkeypatch):
     calls = CallService(live_settings(tmp_path))
 
-    async def ready():
+    async def ready(*_):
         return False
 
     async def forbidden(*_):
         raise AssertionError("unready model must not trigger a phone call")
 
-    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls, "_prepare_model", ready)
     monkeypatch.setattr(calls.vih, "dial", forbidden)
     created = await calls.start(StartCall.model_validate(body()), "unready-model")
     assert created.state == "failed"
@@ -98,14 +98,14 @@ async def test_model_unavailable_never_dials(tmp_path, monkeypatch):
 async def test_cdr_arriving_before_http_response_is_reconciled(tmp_path, monkeypatch):
     calls = CallService(live_settings(tmp_path))
 
-    async def ready():
+    async def ready(*_):
         return True
 
     async def dial(*_):
         assert calls.cdr({"event": "cdr", "callSid": "CA-fast", "disposition": "NO_ANSWER"})[0] is None
         return DialResult("submitted", {"body": {"callSid": "CA-fast"}})
 
-    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls, "_prepare_model", ready)
     monkeypatch.setattr(calls.vih, "dial", dial)
     created = await calls.start(StartCall.model_validate(body()), "fast-no-answer")
     result = calls.result(created.callId)
@@ -118,7 +118,7 @@ async def test_cdr_arriving_before_http_response_is_reconciled(tmp_path, monkeyp
 async def test_early_stream_provider_ids_survive_missing_dial_response_id(tmp_path, monkeypatch):
     calls = CallService(live_settings(tmp_path))
 
-    async def ready():
+    async def ready(*_):
         return True
 
     async def dial(phone, wss):
@@ -128,7 +128,7 @@ async def test_early_stream_provider_ids_survive_missing_dial_response_id(tmp_pa
         await calls.bind_stream(call_id, start_event())
         return DialResult("submitted", {"body": {"accepted": True}})
 
-    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls, "_prepare_model", ready)
     monkeypatch.setattr(calls.vih, "dial", dial)
     created = await calls.start(StartCall.model_validate(body()), "early-stream-ids")
     result = calls.result(created.callId)
@@ -146,7 +146,7 @@ async def test_stop_before_dial_response_stays_complete_without_cdr(tmp_path, mo
     calls = CallService(config)
     dial_count = 0
 
-    async def ready():
+    async def ready(*_):
         return True
 
     async def dial(phone, wss):
@@ -159,7 +159,7 @@ async def test_stop_before_dial_response_stays_complete_without_cdr(tmp_path, mo
         await calls.finish_media(call_id, "provider_stop", "Saved greeting", {}, {})
         return DialResult("submitted", {"body": {"accepted": True}})
 
-    monkeypatch.setattr(calls, "_runtime_ready", ready)
+    monkeypatch.setattr(calls, "_prepare_model", ready)
     monkeypatch.setattr(calls.vih, "dial", dial)
     request = StartCall.model_validate(body())
     created = await calls.start(request, "stop-before-http")

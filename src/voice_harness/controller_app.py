@@ -144,6 +144,7 @@ def create_controller_app(store: SessionStore, calls: CallService | None = None,
         if cdr.event != "cdr":
             raise HTTPException(422, "event must be cdr")
         call_id, duplicate = calls.cdr(payload)
+        await calls.release_model_if_terminal(call_id)
         return {"accepted": True, "duplicate": duplicate, "callId": call_id}
 
     @app.post(
