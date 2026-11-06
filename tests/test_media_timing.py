@@ -37,7 +37,7 @@ def test_sample_clock_splits_partial_frames_and_preserves_silence():
         fifo.append(b"x")
 
 
-def test_absolute_deadlines_never_burst_after_stall_or_late_send():
+def test_absolute_deadlines_rebase_after_a_full_frame_stall_without_burst():
     clock = Deadline(0)
     sends = []
     now = 0
@@ -50,6 +50,86 @@ def test_absolute_deadlines_never_burst_after_stall_or_late_send():
     assert all(b - a >= 0.020 - 1e-9 for a, b in pairwise(sends))
     assert clock.missed == 5 and clock.late == 1
     assert clock.max_lateness_ms == pytest.approx(105)
+
+
+@pytest.mark.parametrize("wake_jitter,work_ms", [
+    (0.001, 0), (0.0007, 1.2), (0.002, 3), (0.015, 1), (0.019, 0),
+])
+def test_small_wake_and_send_overhead_do_not_accumulate_clock_drift(wake_jitter, work_ms):
+    clock = Deadline(0)
+    now = 0.0
+    for _ in range(15_000):  # Five minutes of media, without wall-clock sleeps.
+        now += clock.delay(now) + wake_jitter
+        now += work_ms / 1000
+        clock.advance(now)
+    assert now == pytest.approx(299.98 + wake_jitter + work_ms / 1000, abs=1e-7)
+    assert clock.next == pytest.approx(300, abs=1e-7)
+    assert clock.missed == 0
+
+
+def test_100ms_provider_packets_do_not_fill_the_input_buffer_under_normal_jitter():
+    # Reproduces the VM's 800-byte mu-law packets: 100 ms / 800 PCM16 samples.
+    fifo = SampleFIFO(1000)
+    clock = Deadline(.060)
+    next_packet = now = 0.0
+    ticks = 9000  # Three minutes; the old scheduler overflowed in ~20 seconds.
+    for index in range(ticks):
+        now += clock.delay(now) + (.0007 if index % 3 else .0015)
+        while next_packet <= now:
+            fifo.append(struct.pack("<h", 42) * 800)
+            next_packet += .100
+        clock.advance(now)
+        pcm, real = fifo.tick()
+        assert pcm == struct.pack("<h", 42) * 160 and real == 160
+        now += .001  # Codec/send work must not become permanent extra frame time.
+    assert fifo.overflows == fifo.silence == 0
+    assert fifo.high_water / 8 <= 200
+    assert fifo.real_sent == ticks * 160
+    assert fifo.received - fifo.real_sent == fifo.samples
+    assert now < 180.1
+
+
+def test_paced_output_does_not_accumulate_a_backlog_from_send_overhead():
+    fifo = PlaybackFIFO(400)
+    clock = Deadline(0)
+    next_generated = now = 0.0
+    sends = []
+    for _ in range(9000):
+        now += clock.delay(now) + .001
+        while next_generated <= now:
+            fifo.check(640, 0)  # Model emits four 20 ms frames every 80 ms.
+            fifo.append(["frame"] * 4, now)
+            next_generated += .080
+        frame = fifo.pop(now)
+        sends.append(now)
+        now += .0015  # Provider send/mark work is compensated on the next wait.
+        fifo.complete(frame, now)
+        clock.advance(now)
+    assert fifo.overflows == 0
+    assert fifo.high_water / 8 <= 100
+    assert now < 180.01
+    assert all(b - a >= .010 - 1e-9 for a, b in pairwise(sends))
+
+
+def test_partial_frame_lateness_has_bounded_phase_correction():
+    clock = Deadline(0)
+    clock.advance(.015)
+    assert clock.next == pytest.approx(.020)  # Compensate jitter without resetting phase.
+    assert clock.delay(.015) == pytest.approx(.005)
+    clock.advance(.020)
+    assert clock.next == pytest.approx(.040)
+    clock.advance(.059)
+    assert clock.delay(.059) == pytest.approx(.001)  # Still a positive cooperative wait.
+
+
+def test_repeated_real_stalls_remain_visible_instead_of_unbounded_catchup():
+    clock = Deadline(0)
+    for _ in range(100):
+        now = clock.next + .105
+        clock.advance(now)
+        assert clock.delay(now) == pytest.approx(.020)
+    assert clock.missed == 500
+    assert clock.late == 100
 
 
 def test_playback_counts_dequeued_frame_residual_and_invalidates_epochs():
@@ -181,10 +261,13 @@ def test_timeline_exclusive_private_capped_and_safe_schema(tmp_path):
 def test_formatter_only_allows_explicit_numeric_media_aggregates():
     record = logging.LogRecord("voice_harness", 20, "", 1, "secret", (), None)
     record.safe_event = {"event": "media_progress", "input_missed_ticks": 3,
+                         "input_queue_ms": 120, "input_late_ticks": 15, "input_max_lateness_ms": 1.5,
                          "output_queue_high_water_ms": 400, "media_buffer_overflows": 1,
                          "interruption_clears": 2, "input_queue_high_water_ms": float("nan"),
                          "prompt": "secret", "mark_name": "customer-name"}
     output = json.loads(SafeJsonFormatter().format(record))
     assert output["input_missed_ticks"] == 3 and output["interruption_clears"] == 2
+    assert output["input_queue_ms"] == 120 and output["input_late_ticks"] == 15
+    assert output["input_max_lateness_ms"] == 1.5
     assert "secret" not in json.dumps(output) and "input_queue_high_water_ms" not in output
     assert error_code(MediaTimingError("output audio buffer overflow")) == "output_buffer_overflow"

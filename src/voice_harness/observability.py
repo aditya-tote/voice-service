@@ -64,7 +64,8 @@ COUNTERS = frozenset({
     "duration_ms", "inbound_media_frames", "inbound_audio_bytes", "outbound_media_frames",
     "outbound_audio_bytes", "sequence_gaps", "agent_text_chars", "recovered_calls",
     "control_port", "media_port",
-    "input_queue_high_water_ms", "output_queue_high_water_ms", "input_missed_ticks",
+     "input_queue_high_water_ms", "output_queue_high_water_ms", "input_missed_ticks",
+     "input_queue_ms", "input_late_ticks", "input_max_lateness_ms",
     "output_missed_ticks", "media_buffer_overflows", "interruption_clears",
 })
 BOOLEANS = frozenset({"simulated", "duplicate", "matched", "recovery_required", "recording_enabled",

@@ -67,7 +67,12 @@ class SampleFIFO:
 
 
 class Deadline:
-    """Pure absolute deadline. Stalls rebase; never emit catch-up bursts."""
+    """Keep the nominal media phase through jitter; rebase after a full-frame stall.
+
+    Small late wakes must shorten the next wait instead of permanently slowing
+    the sample clock. A real missed frame starts a new schedule rather than a
+    bulk catch-up loop. Each writer still yields between individual frames.
+    """
 
     def __init__(self, first: float):
         self.next = first
@@ -83,8 +88,13 @@ class Deadline:
             self.late += 1
         self.missed += int((lateness + 1e-9) / FRAME_SECONDS)
         self.max_lateness_ms = max(self.max_lateness_ms, lateness * 1000)
-        # Even a slightly late send must not be followed by a faster-than-real-time send.
-        self.next = max(self.next + FRAME_SECONDS, now + FRAME_SECONDS)
+        if lateness + 1e-9 >= FRAME_SECONDS:
+            self.next = now + FRAME_SECONDS
+        else:
+            # Re-anchoring every tick to now + 20 ms accumulated normal sleep and
+            # send overhead. A 1 ms late wake then consumed only ~48 frames/sec,
+            # overflowing a healthy 50-frame/sec caller's bounded input queue.
+            self.next += FRAME_SECONDS
 
 
 @dataclass(frozen=True)

@@ -63,7 +63,11 @@ cannot be placed at historical capture time without trusted timestamps.
 Input and output producers/readers/writers are independent; a separate clear
 control task cannot be blocked by a full audio queue or pause model input.
 All tasks are bounded by call lifetime and cancellable; network sends retain
-existing timeouts. Scheduler stalls rebase without inference/playback bursts.
+existing timeouts. The nominal media interval is 20 ms. Routine wake/send jitter
+is compensated against the previous deadline instead of accumulating as drift;
+phase correction shortens the next wait and still yields between frames. A stall
+of a full 20 ms or more rebases to now + 20 ms rather than sending a backlog in a burst. This is not a
+guarantee that every individual inter-send interval is at least 20 ms.
 The 400 ms output cap may expose a bursty or overloaded deployment as a safe
 bridge failure; inspect overflow/high-water data, do not remove bounds silently.
 
@@ -175,6 +179,23 @@ Only then consider an explicitly calibrated energy A/B. Disabling the heuristic
 restores native-only behavior for new sessions; do not reconnect active calls.
 Keep existing production prompt/voice defaults. No Hindi, tools/ASR, calendar,
 CRM, opt-out database or real hangup implementation is introduced.
+
+### Input-buffer-overflow pacing hotfix
+
+The initial pacing implementation reset every deadline from the actual wake/send
+time. Small positive scheduling delays therefore accumulated, making a healthy
+100 ms-packet input outpace the nominal 20 ms consumer until its 1000 ms buffer
+filled. The [pacing hotfix](personaplex-pacing-hotfix.md) preserves the nominal
+phase under ordinary jitter; it does not raise limits, drop caller speech or
+disable overflow safety. Real sustained overload can still overflow a queue.
+`media_progress` now includes `input_queue_ms`, `input_late_ticks` and
+`input_max_lateness_ms`, alongside queue high-water/missed-tick counters.
+
+Deploy after draining/reconciling calls, retain the existing environment and DB,
+and restart the single harness process. PersonaPlex does not need a restart for
+this client-side change. A failed attempt left `recovery_required` must be
+reconciled against the provider's actual outcome before another attempt; never
+release all reservations or restart merely to bypass an uncertain call.
 
 ## Privacy and limitations
 
