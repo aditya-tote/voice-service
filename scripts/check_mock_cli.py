@@ -23,6 +23,23 @@ def port():
         return sock.getsockname()[1]
 
 
+def stop(process):
+    if process.poll() is None:
+        if sys.platform == "win32":
+            # A Windows venv Python may be a launcher with an interpreter child.
+            # Kill only this still-live test process's tree, never by image name.
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False, timeout=5)
+        else:
+            process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def run():
     (ROOT / "tmp").mkdir(exist_ok=True)
     control, media = port(), port()
@@ -48,7 +65,10 @@ def run():
 
     with tempfile.TemporaryDirectory(prefix="vah-acceptance-", dir=ROOT / "tmp") as directory:
         task_dir = Path(directory)
-        env = os.environ.copy()
+        # Do not inherit live provider, recording, model, or experimental media settings.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("VIH_", "MEDIA_", "PERSONAPLEX_", "CONTROLLER_"))
+               and key not in {"RECORDING_DIR", "ENABLE_LIVE_DIALS"}}
         env.update(
             PYTHONPATH=str(SERVICE / "src"),
             CONTROL_HOST="127.0.0.1",
@@ -91,15 +111,6 @@ def run():
             except BaseException:
                 stop(process)
                 raise
-
-        def stop(process):
-            if process.poll() is None:
-                process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
 
         payload = {
             "leadId": "lead-local-acceptance",

@@ -43,3 +43,5 @@ recordings/
 *.ulaw
 logs/
 *.log
+artifacts/personaplex-eval/
+*-timeline.jsonl

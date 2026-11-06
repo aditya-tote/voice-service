@@ -98,7 +98,7 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
             codecs.append(self)
 
         def phone_to_opus(self, pcm):
-            assert pcm == b"\0\0" * 800
+            assert pcm == b"\0\0" * 160
             return [b"phone-opus"]
 
         def opus_to_phone(self, packet):
@@ -119,8 +119,9 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
 
         async def send_opus(self, packet):
             self.sent.append(packet)
-            await self.frames.put(b"\x01first")
-            await self.frames.put(b"\x01second")
+            if len(self.sent) == 1:
+                await self.frames.put(b"\x01first")
+                await self.frames.put(b"\x01second")
 
         async def recv(self):
             return await self.frames.get()
@@ -186,7 +187,13 @@ async def test_start_to_vih_audio_recording_cdr_and_durable_result(tmp_path, mon
     assert (tmp_path / "audio" / result["recordings"]["caller"]).stat().st_size == 800
     assert (tmp_path / "audio" / result["recordings"]["agent"]).stat().st_size == 320
     assert socket.closed and clients[0].closed and codecs[0].closed
-    assert clients[0].sent == [b"phone-opus"]
+    assert clients[0].sent and all(packet == b"phone-opus" for packet in clients[0].sent)
+    assert result["streamStats"]["inputRealSamplesSent"] >= 160
+    assert result["streamStats"]["interruptionMode"] == "off"
+    timeline = tmp_path / "audio" / result["recordings"]["timeline"]
+    rows = [json.loads(line) for line in timeline.read_text().splitlines()]
+    assert any(row["event"] == "caller_arrival" and row["samples"] == 800 for row in rows)
+    assert sum(row["samples"] for row in rows if row["event"] == "provider_send") == 320
     assert calls.repository.get(call_id)["gpu_lease"] == 0
     assert token not in json.dumps(result)
     events = [record.safe_event for record in caplog.records if record.name == "voice_harness"]
@@ -223,6 +230,9 @@ async def test_vih_failure_cleanup_preserves_unknown_provider_lease(tmp_path, mo
     clients = []
 
     class Codec:
+        def phone_to_opus(self, pcm):
+            return []
+
         def close(self):
             pass
 
@@ -357,4 +367,254 @@ async def test_live_media_missing_prepared_session_fails_without_reconnecting(tm
     assert socket.closed and result["state"] == "recovery_required"
     assert calls.repository.get(record["id"])["gpu_lease"] == 1
     assert result["customerTranscript"] is None
+    calls.repository.connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,activity_frames,expected_clears", [
+    ("off", 25, 0), ("sustained_energy", 8, 0), ("sustained_energy", 25, 1),
+])
+async def test_continuous_input_playback_energy_and_stop_authority(
+    tmp_path, monkeypatch, mode, activity_frames, expected_clears,
+):
+    config = settings(tmp_path, media_interruption_mode=mode, media_input_startup_ms=0)
+    calls = CallService(config)
+    record, _ = calls.repository.create_or_replay("continuous-media-test", body(), False)
+    call_id = record["id"]
+    calls.repository.update(call_id, state="dial_submitted", gpu_lease=1)
+    calls.repository.set_media_token(call_id, "one-use-token")
+    clients, codecs = [], []
+    class Codec:
+        def __init__(self):
+            self.inputs, self.decodes, self.closed = [], 0, False
+            codecs.append(self)
+        def phone_to_opus(self, pcm):
+            self.inputs.append(pcm)
+            return [b"opus"]
+        def opus_to_phone(self, packet):
+            self.decodes += 1
+            return struct.pack("<hh", -2000, 2000) * 80
+        def close(self):
+            self.closed = True
+    class Model:
+        def __init__(self, *args):
+            self.frames, self.sent, self.connections, self.closed = asyncio.Queue(), 0, 0, False
+            clients.append(self)
+        async def connect(self):
+            self.connections += 1
+        async def send_opus(self, packet):
+            self.sent += 1
+            await self.frames.put(b"\x01continuous-audio")
+        async def recv(self):
+            return await self.frames.get()
+        async def close(self):
+            self.closed = True
+    monkeypatch.setattr(vih_media, "StreamingCodec", Codec)
+    monkeypatch.setattr(vih_media, "PersonaPlexClient", Model)
+    socket = Socket("one-use-token")
+    task = asyncio.create_task(vih_media.create_vih_media_app(calls).routes[0].endpoint(socket, call_id))
+    await socket.event({"event": "connected"})
+    await socket.event(start_event())
+    # All samples arrive in order, then a deliberate provider media gap. The clock keeps sending silence.
+    loud = encode_mulaw(struct.pack("<hh", -3000, 3000) * 80 * activity_frames)
+    await socket.event({"event": "media", "sequenceNumber": "2", "streamSid": "MZ-test",
+                        "media": {"payload": base64.b64encode(loud).decode()}})
+    await asyncio.sleep(.9)
+    await socket.event({"event": "stop", "sequenceNumber": "3", "streamSid": "MZ-test",
+                        "stop": {"callSid": "CA-test", "accountSid": "AC-test"}})
+    await asyncio.wait_for(task, 2)
+    output = []
+    while not socket.outgoing.empty():
+        output.append(socket.outgoing.get_nowait())
+    result = calls.result(call_id)
+    assert result["streamReason"] == "provider_stop"
+    assert result["streamStats"]["interruptionClears"] == expected_clears
+    assert sum(frame["event"] == "clear" for frame in output) == expected_clears
+    assert result["streamStats"]["marksSent"] == sum(frame["event"] == "mark" for frame in output)
+    assert clients[0].connections == 1 and len(clients) == len(codecs) == 1
+    assert clients[0].sent > activity_frames
+    # Stop may cancel the final just-enqueued model response; decoding continued through overlap.
+    assert activity_frames <= codecs[0].decodes <= clients[0].sent
+    assert result["streamStats"]["inputSyntheticSilenceSamples"] > 0
+    if expected_clears:
+        assert result["streamStats"]["outputSuppressedMs"] > 0
+    assert clients[0].closed and codecs[0].closed
+    assert socket.outgoing.empty()
+    assert len(codecs[0].inputs) * 160 == (result["streamStats"]["inputRealSamplesSent"]
+                                         + result["streamStats"]["inputSyntheticSilenceSamples"])
+    # Recording off: no audio, metadata or output paths are created.
+    assert result["recordings"] == {} and not (tmp_path / "audio").exists()
+    calls.repository.connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_before_clear", [False, True])
+async def test_clear_control_does_not_block_input_and_stop_wins_send_lock_race(tmp_path, monkeypatch, stop_before_clear):
+    config = settings(tmp_path, media_interruption_mode="sustained_energy", media_input_startup_ms=0,
+                      media_output_max_buffer_ms=1000)
+    calls = CallService(config)
+    record, _ = calls.repository.create_or_replay("locked-send-media-test", body(), False)
+    call_id = record["id"]
+    calls.repository.update(call_id, state="dial_submitted", gpu_lease=1)
+    calls.repository.set_media_token(call_id, "one-use-token")
+    release, enough_input = asyncio.Event(), asyncio.Event()
+    clients = []
+    class Codec:
+        def phone_to_opus(self, pcm):
+            return [b"opus"]
+        def opus_to_phone(self, packet):
+            return struct.pack("<hh", -2000, 2000) * 80
+        def close(self):
+            pass
+    class Model:
+        def __init__(self, *args):
+            self.frames, self.inputs = asyncio.Queue(), 0
+            clients.append(self)
+        async def connect(self):
+            pass
+        async def send_opus(self, packet):
+            self.inputs += 1
+            if self.inputs >= 24:
+                enough_input.set()
+            await self.frames.put(b"\x01audio")
+        async def recv(self):
+            return await self.frames.get()
+        async def close(self):
+            pass
+    class LockedSocket(Socket):
+        async def send_text(self, message):
+            await super().send_text(message)
+            if json.loads(message)["event"] == "media" and not release.is_set():
+                await release.wait()
+    monkeypatch.setattr(vih_media, "StreamingCodec", Codec)
+    monkeypatch.setattr(vih_media, "PersonaPlexClient", Model)
+    socket = LockedSocket("one-use-token")
+    await socket.event({"event": "connected"})
+    await socket.event(start_event())
+    loud = encode_mulaw(struct.pack("<hh", -3000, 3000) * 80 * 30)
+    await socket.event({"event": "media", "sequenceNumber": "2", "streamSid": "MZ-test",
+                        "media": {"payload": base64.b64encode(loud).decode()}})
+    task = asyncio.create_task(vih_media.create_vih_media_app(calls).routes[0].endpoint(socket, call_id))
+    await asyncio.wait_for(enough_input.wait(), 2)
+    # Clear has confirmed at tick 20. Input still advances while control waits for a slow media send.
+    assert clients[0].inputs >= 24
+    stop = {"event": "stop", "sequenceNumber": "3", "streamSid": "MZ-test",
+            "stop": {"callSid": "CA-test", "accountSid": "AC-test"}}
+    if stop_before_clear:
+        await socket.event(stop)
+        await asyncio.sleep(.02)
+    release.set()
+    if not stop_before_clear:
+        async with asyncio.timeout(2):
+            while socket.outgoing.qsize() < 2:
+                await asyncio.sleep(.005)
+        await socket.event(stop)
+    await asyncio.wait_for(task, 2)
+    frames = []
+    while not socket.outgoing.empty():
+        frames.append(socket.outgoing.get_nowait())
+    assert [frame["event"] for frame in frames] == (["media"] if stop_before_clear else ["media", "clear"])
+    stats = calls.result(call_id)["streamStats"]
+    assert stats["interruptionConfirmed"] == 1
+    assert stats["outputDiscardedClearMs"] > 0 and stats["outputSuppressedMs"] > 0
+    assert calls.result(call_id)["streamReason"] == "provider_stop"
+    calls.repository.connection.close()
+
+
+def test_recording_partial_creation_never_overwrites_existing_files(tmp_path):
+    call_id = "call_" + "a" * 36
+    existing = tmp_path / f"{call_id}-agent.ulaw"
+    existing.write_bytes(b"preserve")
+    with pytest.raises(FileExistsError):
+        vih_media._Recordings(str(tmp_path), call_id, 8000)
+    assert existing.read_bytes() == b"preserve"
+    # The partially created caller file is closed, private, and can be reopened by its owner.
+    with (tmp_path / f"{call_id}-caller.ulaw").open("ab") as stream:
+        stream.write(b"closed cleanly")
+
+
+@pytest.mark.asyncio
+async def test_synthetic_silence_does_not_hide_dead_provider(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="voice_harness")
+    config = settings(tmp_path, idle_timeout_seconds=.2, media_input_startup_ms=0)
+    calls = CallService(config)
+    record, _ = calls.repository.create_or_replay("dead-provider-media-test", body(), False)
+    call_id = record["id"]
+    calls.repository.update(call_id, state="dial_submitted", gpu_lease=1)
+    calls.repository.set_media_token(call_id, "one-use-token")
+    class Codec:
+        def phone_to_opus(self, pcm):
+            assert pcm == b"\0\0" * 160
+            return [b"silence-opus"]
+        def opus_to_phone(self, packet):
+            return b"\0\0" * 160
+        def close(self):
+            pass
+    class Model:
+        def __init__(self, *args):
+            self.frames = asyncio.Queue()
+        async def connect(self):
+            pass
+        async def send_opus(self, packet):
+            # Keep the model receive direction active; provider timeout must be independent.
+            await self.frames.put(b"\x01audio")
+        async def recv(self):
+            return await self.frames.get()
+        async def close(self):
+            pass
+    monkeypatch.setattr(vih_media, "StreamingCodec", Codec)
+    monkeypatch.setattr(vih_media, "PersonaPlexClient", Model)
+    socket = Socket("one-use-token")
+    await socket.event({"event": "connected"})
+    await socket.event(start_event())
+    await asyncio.wait_for(vih_media.create_vih_media_app(calls).routes[0].endpoint(socket, call_id), 2)
+    result = calls.result(call_id)
+    assert result["streamReason"] == "call_timeout" and result["recoveryRequired"]
+    assert result["streamStats"]["inputSyntheticSilenceSamples"] >= 160
+    assert result["streamStats"]["inboundMediaFrames"] == 0
+    errors = [record.safe_event for record in caplog.records if getattr(record, "safe_event", {}).get("event") == "media_failed"]
+    assert errors[0]["stage"] == "provider_receive"
+    calls.repository.connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["input", "output"])
+async def test_media_overflow_fails_bounded_without_releasing_uncertain_lease(tmp_path, monkeypatch, direction):
+    config = settings(tmp_path, media_input_max_buffer_ms=100, media_output_max_buffer_ms=100)
+    calls = CallService(config)
+    record, _ = calls.repository.create_or_replay("overflow-media-test", body(), False)
+    call_id = record["id"]
+    calls.repository.update(call_id, state="dial_submitted", gpu_lease=1)
+    calls.repository.set_media_token(call_id, "one-use-token")
+    class Codec:
+        def phone_to_opus(self, pcm):
+            return []
+        def opus_to_phone(self, packet):
+            return b"\0\0" * 801
+        def close(self):
+            pass
+    class Model:
+        def __init__(self, *args):
+            pass
+        async def connect(self):
+            pass
+        async def recv(self):
+            if direction == "output":
+                return b"\x01burst"
+            await asyncio.Future()
+        async def close(self):
+            pass
+    monkeypatch.setattr(vih_media, "StreamingCodec", Codec)
+    monkeypatch.setattr(vih_media, "PersonaPlexClient", Model)
+    socket = Socket("one-use-token")
+    await socket.event({"event": "connected"})
+    await socket.event(start_event())
+    if direction == "input":
+        await socket.event({"event": "media", "sequenceNumber": "2", "streamSid": "MZ-test",
+                            "media": {"payload": base64.b64encode(b"\xff" * 801).decode()}})
+    await asyncio.wait_for(vih_media.create_vih_media_app(calls).routes[0].endpoint(socket, call_id), 2)
+    result = calls.result(call_id)
+    assert result["streamStats"][f"{direction}Overflows"] == 1
+    assert result["recoveryRequired"] and calls.repository.get(call_id)["gpu_lease"] == 1
+    assert socket.outgoing.get_nowait()["event"] == "clear"
     calls.repository.connection.close()

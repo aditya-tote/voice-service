@@ -56,3 +56,27 @@ def test_handshake_timeout_is_redacted():
         await server.wait_closed()
 
     asyncio.run(run())
+
+
+def test_evaluation_client_refuses_redirect_before_any_second_connection():
+    async def run():
+        contacted = []
+        async def unexpected(socket):
+            contacted.append(True)
+            await socket.send(b"\x00")
+        async with websockets.serve(unexpected, "127.0.0.1", 0) as target:
+            target_port = target.sockets[0].getsockname()[1]
+            def redirect(connection, request):
+                response = connection.respond(302, "redirect")
+                response.headers["Location"] = f"ws://127.0.0.1:{target_port}/api/chat"
+                return response
+            async with websockets.serve(unexpected, "127.0.0.1", 0, process_request=redirect) as server:
+                port = server.sockets[0].getsockname()[1]
+                client = PersonaPlexClient(f"ws://127.0.0.1:{port}/api/chat", 1, allow_redirects=False)
+                try:
+                    with pytest.raises(PersonaPlexError):
+                        await client.connect()
+                finally:
+                    await client.close()
+                assert not contacted and client.socket is None
+    asyncio.run(run())

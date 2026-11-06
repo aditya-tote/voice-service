@@ -118,6 +118,11 @@ def validate_model_budget(prompt: str, url: str) -> tuple[int, int]:
 
 def model_connection_url(base: str, lead_context: LeadContext, voice: str, *, now: datetime | None = None) -> str:
     prompt = build_outbound_prompt(lead_context, now=now)
+    return budgeted_prompt_url(base, prompt, voice)
+
+
+def budgeted_prompt_url(base: str, prompt: str, voice: str) -> str:
+    """Shared exact transport budget for production and repository-owned evaluation prompts."""
     split = urlsplit(base)
     query = [(key, value) for key, value in parse_qsl(split.query, keep_blank_values=True)
              if key not in {"voice_prompt", "text_prompt"}]
@@ -133,8 +138,9 @@ def model_connection_url(base: str, lead_context: LeadContext, voice: str, *, no
 class PersonaPlexClient:
     """Uses the optional `websockets` dependency to protect FastAPI from upstream details."""
 
-    def __init__(self, url: str, ready_timeout: float):
+    def __init__(self, url: str, ready_timeout: float, *, allow_redirects: bool = True):
         self.url, self.ready_timeout, self.socket = url, ready_timeout, None
+        self.allow_redirects = allow_redirects
 
     async def connect(self) -> None:
         try:
@@ -143,11 +149,15 @@ class PersonaPlexClient:
             raise PersonaPlexError("Install voice-agent-harness[runtime] on the GPU VM") from error
         import asyncio
 
+        class NoRedirectConnect(connect):
+            def process_redirect(self, exc):
+                return exc
+
         quiet_logger = logging.getLogger("voice_harness.private_model")
         quiet_logger.disabled = True
         try:
             self.socket = await asyncio.wait_for(
-                connect(
+                (connect if self.allow_redirects else NoRedirectConnect)(
                     self.url,
                     max_size=16384,
                     max_queue=8,

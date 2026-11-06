@@ -1,3 +1,4 @@
+import math
 import re
 from dataclasses import dataclass
 from ipaddress import ip_address
@@ -55,8 +56,29 @@ class Settings:
     recording_dir: str = ""
     vih_phone_format: str = "e164"
     default_voice: str = "NATF2.pt"
+    media_input_startup_ms: int = 60
+    media_input_max_buffer_ms: int = 1000
+    media_output_max_buffer_ms: int = 400
+    media_interruption_mode: str = "off"
+    media_interruption_rms: float = 1000
+    media_interruption_sustain_ms: int = 400
+    media_interruption_release_ms: int = 300
 
     def __post_init__(self) -> None:
+        for name, low, high in (
+            ("media_input_startup_ms", 0, 200), ("media_input_max_buffer_ms", 100, 2000),
+            ("media_output_max_buffer_ms", 100, 2000), ("media_interruption_sustain_ms", 300, 1500),
+            ("media_interruption_release_ms", 100, 1000),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not low <= value <= high or value % 20:
+                raise ValueError(f"{name.upper()} must be a bounded multiple of 20")
+        if self.media_input_max_buffer_ms <= self.media_input_startup_ms:
+            raise ValueError("MEDIA_INPUT_MAX_BUFFER_MS must exceed MEDIA_INPUT_STARTUP_MS")
+        if self.media_interruption_mode not in {"off", "sustained_energy"}:
+            raise ValueError("MEDIA_INTERRUPTION_MODE must be off or sustained_energy")
+        if not math.isfinite(self.media_interruption_rms) or not 100 <= self.media_interruption_rms <= 12000:
+            raise ValueError("MEDIA_INTERRUPTION_RMS must be finite and between 100 and 12000")
         if not _private_host(self.control_host) or self.media_host not in {"127.0.0.1", "::1"}:
             raise ValueError(
                 "CONTROL_HOST must be Tailscale/loopback and MEDIA_HOST must be loopback"
@@ -185,6 +207,13 @@ class Settings:
             personaplex_url=getenv("PERSONAPLEX_URL", "ws://127.0.0.1:8998/api/chat"),
             allowed_voices=frozenset(filter(None, getenv("ALLOWED_VOICES", "").split(","))),
             default_voice=getenv("DEFAULT_VOICE", "NATF2.pt"),
+            media_input_startup_ms=int(getenv("MEDIA_INPUT_STARTUP_MS", "60")),
+            media_input_max_buffer_ms=int(getenv("MEDIA_INPUT_MAX_BUFFER_MS", "1000")),
+            media_output_max_buffer_ms=int(getenv("MEDIA_OUTPUT_MAX_BUFFER_MS", "400")),
+            media_interruption_mode=getenv("MEDIA_INTERRUPTION_MODE", "off"),
+            media_interruption_rms=float(getenv("MEDIA_INTERRUPTION_RMS", "1000")),
+            media_interruption_sustain_ms=int(getenv("MEDIA_INTERRUPTION_SUSTAIN_MS", "400")),
+            media_interruption_release_ms=int(getenv("MEDIA_INTERRUPTION_RELEASE_MS", "300")),
             controller_callback_base_url=getenv(
                 "CONTROLLER_CALLBACK_BASE_URL", "http://127.0.0.1:9000"
             ),
